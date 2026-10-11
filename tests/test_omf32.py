@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from binary_comp.analyzers.omf import (
-    OmfCompareError, OmfCompareSpec, OmfLiteralSpec,
-    compare_omf_spec, compare_omf_spec_bytes, format_omf_comparison,
+    EmbeddedTable, OmfCompareError, OmfCompareSpec, OmfLiteralSpec,
+    compare_omf_spec, compare_omf_spec_bytes, embedded_tables, format_omf_comparison,
 )
 from binary_comp.cli import main
 
@@ -172,3 +172,74 @@ def test_raw_cli_preserves_16_bit_default(tmp_path, capsys):
     assert main(["omf-compare", "--original", str(original), "--original-offset", "0",
                  "--object", str(obj), "--size", "4"]) == 0
     assert "result:   MATCH" in capsys.readouterr().out
+
+
+# A switch: the indexing jump's displacement is followed directly by a
+# three-entry table, then the three cases.
+SWITCH_TABLE = 0x0C
+SWITCH_CASES = (0x18, 0x1E, 0x24)
+SWITCH_FIXUPS = (0x08, 0x0C, 0x10, 0x14)
+
+
+def switch_code(base):
+    code = bytearray.fromhex("83 f8 02 77 1f ff 24 85") + (base + SWITCH_TABLE).to_bytes(4, "little")
+    for case in SWITCH_CASES:
+        code += (base + case).to_bytes(4, "little")
+    for value in (1, 2, 3):
+        code += bytes([0xB8, value, 0, 0, 0, 0xC3])
+    return bytes(code)
+
+
+def segment_fixup(offset):
+    # Segment-relative 32-bit offset at ``offset`` in the preceding LEDATA32.
+    return bytes([0xE4 | (offset >> 8), offset & 0xFF]) + bytes.fromhex("16 02 01")
+
+
+@pytest.fixture
+def switch_sample(tmp_path):
+    original = tmp_path / "original.bin"
+    original.write_bytes(b"\0" * 0x30 + switch_code(0x10200))
+    obj = tmp_path / "switch.obj"
+    code = switch_code(0x10)
+    obj.write_bytes(
+        ledata(1, 0x10, code)
+        + record(0x9D, b"".join(segment_fixup(offset) for offset in SWITCH_FIXUPS))
+        + ledata(1, 0x10 + len(code), b"\x90\xc3")
+        + record(0x91, b"\0\x01" + public("Select_", 0x10) + public("Next_", 0x10 + len(code)))
+    )
+    return OmfCompareSpec(
+        name="Select", function_name="Select", original_path=str(original),
+        original_offset=0x30, original_address=0x10200, object_path=str(obj),
+        size=len(code), bits=32, symbol="Select_",
+        expected_fixups=tuple((offset, 4) for offset in SWITCH_FIXUPS),
+    )
+
+
+def test_embedded_jump_table_is_not_decoded_as_code(switch_sample):
+    assert compare_omf_spec_bytes(switch_sample).matches
+    comparison = compare_omf_spec(switch_sample)
+    for side, base in ((comparison.original, 0x10200), (comparison.rebuilt, 0x10)):
+        by_address = {instruction.address - base: instruction for instruction in side.instructions}
+        assert [by_address[offset].mnemonic for offset in (0x0C, 0x10, 0x14)] == ["dd"] * 3
+        assert by_address[0x05].mnemonic == "jmp"
+        assert all(by_address[case].mnemonic == "mov" for case in SWITCH_CASES)
+    assert comparison.original.instructions[3].op_str == "0x10218"
+    assert comparison.similarity == 100
+
+
+def test_adjacent_operands_outside_the_function_are_not_a_table():
+    # mov dword ptr [0x5000], 0x6000 relocates two adjacent words.
+    code = bytes.fromhex("c7 05 00 50 00 00 00 60 00 00 c3")
+    assert embedded_tables(code, ((2, 4), (6, 4)), 0x10200, 0x10200 + len(code)) == ()
+
+
+def test_relocated_values_override_stored_table_words():
+    # Executable formats such as LE store object-relative words that the
+    # loader rebases; the caller supplies the final values.
+    code = switch_code(0x200)
+    linked = {offset: 0x10000 + int.from_bytes(code[offset:offset + 4], "little")
+              for offset in SWITCH_FIXUPS}
+    assert embedded_tables(code, ((offset, 4) for offset in SWITCH_FIXUPS),
+                           0x10200, 0x10200 + len(code)) == ()
+    assert embedded_tables(code, ((offset, 4) for offset in SWITCH_FIXUPS),
+                           0x10200, 0x10200 + len(code), linked) == (EmbeddedTable(0x0C, 4, 3),)

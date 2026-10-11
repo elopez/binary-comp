@@ -399,7 +399,11 @@ function-relative relocation ranges, and `literals` checks associated data:
 ```
 
 `compare --config ... --target sample CheckSlot` prints side-by-side assembly;
-`report` prints mnemonic similarity. For a strict byte gate use
+`report` prints mnemonic similarity. Both decode code around jump tables
+embedded in a function: a run of at least two adjacent relocated words that all
+point back into the function appears as `dd`/`dw` entries instead of being
+decoded as instructions. LE/LX originals supply the entries' final addresses
+from their fixup records. For a strict byte gate use
 `omf-compare --config ... --target sample`, optionally `--function CheckSlot`.
 It checks all selected entries and returns nonzero on byte/length, fixup-layout,
 or literal differences. Config commands build by default; use `--no-build`

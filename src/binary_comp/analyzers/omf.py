@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from binary_comp.analyzers.function_compare import (
     DisassemblyResult,
@@ -14,7 +16,8 @@ from binary_comp.analyzers.function_compare import (
 )
 from binary_comp.analyzers.report import SimilarityReport, SimilarityReportOptions, SimilarityReportRow
 from binary_comp.config import ProjectTarget
-from binary_comp.core.disasm import disassemble_raw
+from binary_comp.core.disasm import Instruction, disassemble_raw
+from binary_comp.core.le import LEImage
 
 
 OMF_LEDATA = 0xA0
@@ -554,15 +557,172 @@ def compare_omf_spec_bytes(spec: OmfCompareSpec) -> OmfComparison:
     )
 
 
+@dataclass(frozen=True)
+class EmbeddedTable:
+    """Relocated words a compiler stores inside a function's code."""
+
+    offset: int
+    width: int
+    count: int
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.width * self.count
+
+
+def embedded_tables(
+    data: bytes,
+    sites: Iterable[tuple[int, int]],
+    low: int,
+    high: int,
+    values: dict[int, int] | None = None,
+) -> tuple[EmbeddedTable, ...]:
+    """Find jump tables embedded in a function's bytes.
+
+    ``sites`` are relocated ``(offset, width)`` fields relative to ``data`` and
+    ``low``/``high`` bound the function's addresses as the words hold them;
+    ``values`` overrides the stored word at an offset, for images whose loader
+    writes the final address. A table is a run of at least two adjacent,
+    equally wide relocated words that all point back into the function.
+    Instruction operands rarely form such runs; a leading word that points
+    into its own run, such as the displacement of the jump that indexes a
+    table placed right after it, is left to the instruction it belongs to.
+    """
+    def value_at(offset: int, width: int) -> int:
+        if values is not None and offset in values:
+            return values[offset]
+        return int.from_bytes(data[offset:offset + width], "little")
+
+    words = sorted({(offset, width) for offset, width in sites
+                    if width in (2, 4) and offset >= 0 and offset + width <= len(data)})
+    tables: list[EmbeddedTable] = []
+    index = 0
+    while index < len(words):
+        width = words[index][1]
+        end = index + 1
+        while end < len(words) and words[end] == (words[end - 1][0] + width, width):
+            end += 1
+        run = [entry for entry, _width in words[index:end]]
+        index = end
+        targets = [value_at(entry, width) for entry in run]
+        while len(run) >= 2 and low + run[0] <= targets[0] < low + run[-1] + width:
+            run, targets = run[1:], targets[1:]
+        if len(run) >= 2 and all(low <= target < high for target in targets):
+            tables.append(EmbeddedTable(run[0], width, len(run)))
+    return tuple(tables)
+
+
+def disassemble_with_tables(
+    data: bytes,
+    address: int,
+    tables: Iterable[EmbeddedTable],
+    *,
+    bits: int,
+    values: dict[int, int] | None = None,
+) -> list[Instruction]:
+    """Disassemble code around embedded tables, emitting one item per entry."""
+    instructions: list[Instruction] = []
+    cursor = 0
+    for table in sorted(tables, key=lambda item: item.offset):
+        if table.offset < cursor:
+            continue
+        if table.offset > cursor:
+            instructions += disassemble_raw(data[cursor:table.offset], address + cursor, bits=bits)
+        directive = "dd" if table.width == 4 else "dw"
+        for entry in range(table.offset, table.end, table.width):
+            value = (values or {}).get(entry, int.from_bytes(data[entry:entry + table.width], "little"))
+            instructions.append(Instruction(
+                address=address + entry,
+                mnemonic=directive,
+                op_str=f"0x{value:x}",
+                operands=(),
+                raw=f"{directive} 0x{value:x}",
+                size=table.width,
+            ))
+        cursor = table.end
+    if cursor < len(data):
+        instructions += disassemble_raw(data[cursor:], address + cursor, bits=bits)
+    return instructions
+
+
+@lru_cache(maxsize=4)
+def linear_executable_relocations(path: str) -> dict[int, tuple[int, int]] | None:
+    """Loader writes of an LE/LX executable, or None for other files."""
+    try:
+        return LEImage(path).relocations()
+    except (OSError, ValueError, IndexError, struct.error):
+        return None
+
+
+def original_relocated_words(spec: OmfCompareSpec, size: int) -> dict[int, int] | None:
+    """Final values of the original window's relocated words, by offset.
+
+    LE/LX pages hold object-relative offsets that the loader rebases, so jump
+    table entries only compare with the function's address after applying the
+    executable's fixup records.
+    """
+    if spec.original_address is None:
+        return None
+    relocations = linear_executable_relocations(str(spec.original_path))
+    if relocations is None:
+        return None
+    start = spec.original_address
+    return {site - start: value for site, (width, value) in relocations.items()
+            if width == 4 and start <= site and site + width <= start + size}
+
+
+def omf_comparison_tables(
+    spec: OmfCompareSpec,
+    comparison: OmfComparison,
+) -> tuple[tuple[EmbeddedTable, ...], tuple[EmbeddedTable, ...], dict[int, int] | None]:
+    """Embedded tables of the original and rebuilt sides of a comparison.
+
+    The rebuilt side uses the object's fixups, whose stored values are offsets
+    in the function's segment. The original side needs the original address:
+    an LE/LX original supplies its relocated words, which are also returned
+    for display; any other original must store linked addresses, located by
+    the reviewed fixup layout when the configuration provides one.
+    """
+    rebuilt_sites = [(fixup.offset - comparison.object_offset, fixup.length)
+                     for fixup in comparison.fixups]
+    rebuilt_tables = embedded_tables(
+        comparison.rebuilt,
+        rebuilt_sites,
+        comparison.object_offset,
+        comparison.object_offset + len(comparison.rebuilt),
+    )
+    original_tables: tuple[EmbeddedTable, ...] = ()
+    original_values = None
+    if spec.original_address is not None:
+        original_values = original_relocated_words(spec, len(comparison.original))
+        if original_values is not None:
+            original_sites = [(offset, 4) for offset in original_values]
+        elif spec.expected_fixups is not None:
+            original_sites = list(spec.expected_fixups)
+        else:
+            original_sites = rebuilt_sites
+        original_tables = embedded_tables(
+            comparison.original,
+            original_sites,
+            spec.original_address,
+            spec.original_address + len(comparison.original),
+            original_values,
+        )
+    return original_tables, rebuilt_tables, original_values
+
+
 def compare_omf_spec(spec: OmfCompareSpec) -> FunctionComparison:
     byte_comparison = compare_omf_spec_bytes(spec)
     address = spec.original_address if spec.original_address is not None else spec.original_offset
+    original_tables, rebuilt_tables, original_values = omf_comparison_tables(spec, byte_comparison)
     original = DisassemblyResult(
-        disassemble_raw(byte_comparison.original, address, bits=spec.bits),
+        disassemble_with_tables(byte_comparison.original, address, original_tables,
+                                bits=spec.bits, values=original_values),
         [],
     )
     rebuilt = DisassemblyResult(
-        disassemble_raw(byte_comparison.rebuilt, byte_comparison.object_offset, bits=spec.bits),
+        disassemble_with_tables(byte_comparison.rebuilt, byte_comparison.object_offset,
+                                rebuilt_tables, bits=spec.bits),
         [],
     )
     if not original.instructions:
