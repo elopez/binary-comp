@@ -966,7 +966,10 @@ def symbolic_struct_array_bytes(decl: GlobalDecl,
         try:
             for field, spec in zip(fields, field_specs):
                 kind = spec.get("kind")
-                if kind == "uint16":
+                if kind == "uint8":
+                    value = eval_int_expr(strip_outer_casts(field), constants)
+                    out.extend(struct.pack("<B", value & 0xFF))
+                elif kind == "uint16":
                     value = eval_int_expr(strip_outer_casts(field), constants)
                     out.extend(struct.pack("<H", value & 0xFFFF))
                 elif kind == "uint32":
