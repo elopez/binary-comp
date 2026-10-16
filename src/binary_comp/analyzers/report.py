@@ -16,6 +16,7 @@ from binary_comp.analyzers.function_compare import (
     maybe_build,
     mnemonic_similarity,
 )
+from binary_comp.analyzers.calls import asm_path_for_source as calls_asm_path_for_source
 from binary_comp.config import ProjectTarget
 from binary_comp.core.disasm import normalize_mnemonic
 from binary_comp.core.pe import PEImage
@@ -69,8 +70,7 @@ def disassembly_path(target: ProjectTarget, address: int) -> str | None:
 def asm_path_for_source(target: ProjectTarget, source_path: str) -> str | None:
     if not target.asm_dir:
         return None
-    basename = os.path.splitext(os.path.basename(source_path))[0] + ".asm"
-    return os.path.join(target.asm_dir, basename)
+    return calls_asm_path_for_source(target, source_path)
 
 
 def asm_line_mnemonic(line: str) -> str | None:

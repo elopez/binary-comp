@@ -377,6 +377,35 @@ def rebuilt_function_addresses(target: ProjectTarget, policy: CallsPolicy) -> di
     return addresses
 
 
+def asm_path_for_source(target: ProjectTarget, source_path: str) -> str:
+    """Locate the compiler listing for a source file.
+
+    Projects that keep sources in subdirectories mirror that structure under
+    ``asm_dir``; prefer the mirrored path so that, say, ``src/ix/sound.cpp``
+    is not checked against ``out/sound.asm`` (the listing for ``src/sound.c``).
+    Fall back to the flat basename layout used by single-directory projects.
+    """
+    flat = os.path.join(
+        target.asm_dir,
+        os.path.splitext(os.path.basename(source_path))[0] + ".asm",
+    )
+    source_abs = os.path.abspath(source_path)
+    root = None
+    for source_dir in target.source_dirs:
+        candidate = os.path.abspath(source_dir)
+        if not source_abs.startswith(candidate + os.sep):
+            continue
+        if root is None or len(candidate) > len(root):
+            root = candidate
+    if root is None:
+        return flat
+    relative = os.path.relpath(source_abs, root)
+    nested = os.path.join(target.asm_dir, os.path.splitext(relative)[0] + ".asm")
+    if nested != flat and os.path.exists(nested):
+        return nested
+    return flat
+
+
 def markers_are_proven_aliases(
     markers: list[SourceAddressMarker],
     target: ProjectTarget,
@@ -394,10 +423,7 @@ def markers_are_proven_aliases(
     for marker in markers:
         if not target.asm_dir:
             return False
-        asm_path = os.path.join(
-            target.asm_dir,
-            os.path.splitext(os.path.basename(marker.source_path))[0] + ".asm",
-        )
+        asm_path = asm_path_for_source(target, marker.source_path)
         fingerprint = compiled_instruction_fingerprint(
             asm_path,
             marker.function_name,
@@ -1116,7 +1142,7 @@ def select_functions(
             if not paths:
                 skipped_no_disasm.append((func_name, addr, cpp_file))
                 continue
-            asm_path = os.path.join(target.asm_dir, os.path.splitext(os.path.basename(cpp_file))[0] + ".asm")
+            asm_path = asm_path_for_source(target, cpp_file)
             functions.append(SelectedFunction(
                 cpp_file,
                 func_name,
