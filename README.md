@@ -184,6 +184,27 @@ Relative paths are resolved from the config file directory. A copy of the
 minimum shape is kept at
 [`examples/minimal-binary-comp.json`](examples/minimal-binary-comp.json).
 
+### Conditional Compilation
+
+Sources that keep a port beside the original code often split one statement
+across `#ifdef` arms, each opening its own brace. The source parser sees every
+arm, so such a body no longer balances and later definitions in the file are
+lost. Declare the macros the reference build defines and leaves undefined, in
+a target or at the top level:
+
+```json
+"preprocessor": {
+  "defined": {"_MSC_VER": "1020"},
+  "undefined": ["PORT"]
+}
+```
+
+`defined` maps names to replacement text, or lists names defined as `1`.
+Conditionals decided by the declaration are reduced to their active arm before
+parsing, tracking `#define` and `#undef` in the file and evaluating `#if`
+expressions. A conditional that tests any other macro is parsed as written,
+and without a declaration every source is parsed exactly as written.
+
 ### Source Function Annotations
 
 Place a `Function start` comment immediately before the rebuilt source function

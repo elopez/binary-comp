@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from binary_comp.source.preprocessor import PreprocessorConfig, configure_preprocessor
+
 
 DEFAULT_CONFIG_PATH = "binary-comp.json"
 
@@ -50,6 +52,7 @@ class ProjectTarget:
     build: BuildConfig = BuildConfig()
     values_policy: str | None = None
     kind: str = "pe"
+    preprocessor: PreprocessorConfig = PreprocessorConfig()
 
 
 def load_json(path: str | os.PathLike[str] | None) -> dict[str, Any]:
@@ -124,6 +127,54 @@ def _ranges(value: Any, label: str) -> tuple[tuple[int, int], ...]:
             raise ConfigError(f"{item_label} end must be >= start")
         ranges.append((start, end))
     return tuple(ranges)
+
+
+def _macro_name(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.isidentifier():
+        raise ConfigError(f"{label} must contain macro names")
+    return value
+
+
+def _preprocessor(value: Any, label: str) -> PreprocessorConfig:
+    """Read the macros the reference build defines and leaves undefined.
+
+    ``defined`` maps names to replacement text, or lists names defined as 1;
+    ``undefined`` lists names the build never defines.  Any other macro stays
+    unknown, so conditionals that test it are parsed as written.
+    """
+    if value is None:
+        return PreprocessorConfig()
+    if not isinstance(value, dict):
+        raise ConfigError(f"{label} must be an object")
+
+    defined_value = value.get("defined", {})
+    if defined_value is None:
+        defined_value = {}
+    if isinstance(defined_value, list):
+        defined_value = {name: "1" for name in defined_value}
+    if not isinstance(defined_value, dict):
+        raise ConfigError(f"{label}.defined must be an object or a list")
+    defined: dict[str, str] = {}
+    for name, text in defined_value.items():
+        if isinstance(text, bool) or not isinstance(text, (str, int)):
+            raise ConfigError(f"{label}.defined.{name} must be a string or an integer")
+        defined[_macro_name(name, f"{label}.defined")] = str(text)
+
+    undefined_value = value.get("undefined", [])
+    if undefined_value is None:
+        undefined_value = []
+    if not isinstance(undefined_value, list):
+        raise ConfigError(f"{label}.undefined must be a list")
+    undefined = frozenset(_macro_name(name, f"{label}.undefined") for name in undefined_value)
+
+    both = sorted(undefined.intersection(defined))
+    if both:
+        raise ConfigError(f"{label} both defines and undefines: {', '.join(both)}")
+    return PreprocessorConfig(
+        enabled=True,
+        defined=tuple(sorted(defined.items())),
+        undefined=undefined,
+    )
 
 
 def _resolve_standalone_path(value: str | None, base: Path) -> str | None:
@@ -237,6 +288,10 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
         build=build,
         values_policy=_resolve_standalone_path(policy, base),
         kind=kind,
+        preprocessor=_preprocessor(
+            target_cfg.get("preprocessor", config.get("preprocessor")),
+            f"targets.{target}.preprocessor" if "preprocessor" in target_cfg else "preprocessor",
+        ),
     )
 
 
@@ -295,15 +350,20 @@ def _target_from_legacy(config: dict[str, Any], target: str) -> ProjectTarget:
             jobs=jobs,
         ),
         values_policy=optional_string(values, "config"),
+        preprocessor=_preprocessor(config.get("preprocessor"), "preprocessor"),
     )
 
 
 def load_project_target(config_path: str | os.PathLike[str], target: str) -> tuple[dict[str, Any], ProjectTarget]:
+    """Load ``target`` and install its preprocessor declaration for source parsing."""
     config = load_json(config_path)
     if "targets" in config:
         base = Path(config_path).resolve().parent
-        return config, _target_from_standalone(config, target, base)
-    return config, _target_from_legacy(config, target)
+        project_target = _target_from_standalone(config, target, base)
+    else:
+        project_target = _target_from_legacy(config, target)
+    configure_preprocessor(project_target.preprocessor)
+    return config, project_target
 
 
 def resolve_path(path: str | None, base: str | os.PathLike[str] | None = None) -> str | None:

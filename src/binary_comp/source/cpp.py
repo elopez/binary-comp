@@ -7,6 +7,8 @@ from bisect import bisect_right
 from dataclasses import dataclass
 from string import hexdigits
 
+from .preprocessor import blank_inactive_conditionals
+
 
 CALLING_CONVENTIONS = (
     b"__cdecl",
@@ -85,7 +87,7 @@ def sanitize_source(source: bytes) -> bytes:
                 break
             sanitized[index:index + len(keyword)] = b" " * len(keyword)
             start = index + len(keyword)
-    return bytes(sanitized)
+    return blank_inactive_conditionals(bytes(sanitized))
 
 
 def walk(node):
@@ -274,7 +276,8 @@ def parse_source_function_markers(
     with open(path, "rb") as f:
         source = f.read()
 
-    tree = make_cpp_parser().parse(sanitize_source(source))
+    sanitized = sanitize_source(source)
+    tree = make_cpp_parser().parse(sanitized)
     lines = source.splitlines()
     transparent_spans: list[tuple[int, int]] = []
     comments: list[tuple[int, int, int, str]] = []
@@ -310,7 +313,9 @@ def parse_source_function_markers(
             continue
 
         function_start, name = functions[function_idx]
-        if gap_is_only_comments_or_whitespace(source, comment_end, function_start, transparent_spans, transparent_starts):
+        # Measure the gap in the parsed text: an arm blanked by the
+        # preprocessor declaration separates nothing the compiler sees.
+        if gap_is_only_comments_or_whitespace(sanitized, comment_end, function_start, transparent_spans, transparent_starts):
             markers.append(SourceFunctionMarker(address=address, name=name, line=line, function_start=function_start))
 
     return markers
