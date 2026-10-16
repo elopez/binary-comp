@@ -11,7 +11,7 @@ from binary_comp.core.symbols import normalize_compiled, symbol_matches, symbol_
 
 from .cpp import SourceFunctionGroup, parse_source_function_groups
 
-SOURCE_EXTENSIONS = (".cpp", ".c", ".C")
+SOURCE_EXTENSIONS = (".cpp", ".c", ".C", ".asm")
 
 
 @dataclass(frozen=True)

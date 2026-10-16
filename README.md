@@ -255,6 +255,22 @@ void debug_overlay(void)
 Like `ASM`, `STUB` omits that function from the default report and verifier
 inventories without claiming that the original assembly is unavailable.
 
+Hand-written assembly kept as `.asm` source is inventoried too. Write the
+annotation as an assembler comment directly before the `proc` line or code
+label that starts the function; comment lines and `align` directives may sit
+between them:
+
+```asm
+; Function start: 0x00439C40
+; Copies the driver name out of its callback table.
+CopyRasterDriverName proc
+```
+
+The function is matched in the map by the name it is written under, so
+decoration added by `.model flat, c` or `stdcall` is found as it is for C.
+Only the function inventory (report, compare, order, export-asm, values and
+SEH) reads assembly sources; the call, global and data audits stay C-only.
+
 ### Global Annotations
 
 Global data analyzers need original addresses either encoded in symbol names or

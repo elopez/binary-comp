@@ -344,6 +344,11 @@ def parse_source_function_markers(
     include_no_assembly: bool = False,
     signature_names: frozenset[str] = frozenset(),
 ) -> list[SourceFunctionMarker]:
+    from .assembly import is_assembly_source, parse_assembly_function_markers
+
+    if is_assembly_source(path):
+        return parse_assembly_function_markers(path, include_no_assembly)
+
     with open(path, "rb") as f:
         source = f.read()
 
@@ -393,6 +398,11 @@ def parse_source_function_markers(
 
 
 def parse_source_function_comments(path: str, include_no_assembly: bool = False) -> list[SourceCommentMarker]:
+    from .assembly import is_assembly_source, parse_assembly_function_comments
+
+    if is_assembly_source(path):
+        return parse_assembly_function_comments(path, include_no_assembly)
+
     with open(path, "rb") as f:
         source = f.read()
 
