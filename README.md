@@ -203,7 +203,9 @@ a target or at the top level:
 Conditionals decided by the declaration are reduced to their active arm before
 parsing, tracking `#define` and `#undef` in the file and evaluating `#if`
 expressions. A conditional that tests any other macro is parsed as written,
-and without a declaration every source is parsed exactly as written.
+and without a declaration every source is parsed exactly as written. MSVC
+`__asm` blocks and statements are always blanked before parsing, so functions
+written in inline assembly stay in the inventory.
 
 ### Source Function Annotations
 

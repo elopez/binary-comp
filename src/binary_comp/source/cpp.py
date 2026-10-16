@@ -24,6 +24,12 @@ CALLING_CONVENTIONS = (
 
 ASM_EXCLUSION_MARKER_RE = re.compile(r"/\*\s*ASM\s*\*/")
 STUB_EXCLUSION_MARKER_RE = re.compile(r"/\*\s*STUB\s*\*/")
+INLINE_ASSEMBLY_RE = re.compile(rb"(?<![A-Za-z0-9_])__?asm(?![A-Za-z0-9_])")
+COMMENT_OR_LITERAL_RE = re.compile(
+    rb"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'",
+    re.S,
+)
+BLANKABLE_RE = re.compile(rb"[^\r\n]")
 
 
 @dataclass(frozen=True)
@@ -87,7 +93,72 @@ def sanitize_source(source: bytes) -> bytes:
                 break
             sanitized[index:index + len(keyword)] = b" " * len(keyword)
             start = index + len(keyword)
-    return blank_inactive_conditionals(bytes(sanitized))
+    return blank_inline_assembly(blank_inactive_conditionals(bytes(sanitized)))
+
+
+def blank_inline_assembly(source: bytes) -> bytes:
+    """Blank MSVC ``__asm`` blocks and statements, which tree-sitter cannot parse.
+
+    One unparsable block turns the rest of the file into an error node and
+    drops every function whose body is inline assembly.  Only the assembly is
+    blanked, keeping offsets and line breaks; the definition around it stays.
+    """
+    if b"asm" not in source:
+        return source
+    skipped = [(match.start(), match.end()) for match in COMMENT_OR_LITERAL_RE.finditer(source)]
+    skipped_starts = [start for start, _ in skipped]
+    blanked = bytearray(source)
+    resume = 0
+    for match in INLINE_ASSEMBLY_RE.finditer(source):
+        start = match.start()
+        if start < resume:
+            continue
+        index = bisect_right(skipped_starts, start) - 1
+        if index >= 0 and skipped[index][0] <= start < skipped[index][1]:
+            continue
+        end = inline_assembly_end(source, match.end())
+        blanked[start:end] = BLANKABLE_RE.sub(b" ", source[start:end])
+        resume = end
+    return bytes(blanked)
+
+
+def inline_assembly_end(source: bytes, keyword_end: int) -> int:
+    """Return the end of the ``__asm`` block or statement after ``keyword_end``."""
+    cursor = keyword_end
+    while cursor < len(source) and source[cursor] in b" \t\r\n":
+        cursor += 1
+    if source.startswith(b"{", cursor):
+        end = scan_inline_assembly(source, cursor + 1, block=True)
+        return keyword_end if end is None else end
+    end = scan_inline_assembly(source, keyword_end, block=False)
+    return len(source) if end is None else end
+
+
+def scan_inline_assembly(source: bytes, cursor: int, block: bool) -> int | None:
+    # A block ends after its closing brace; a statement ends at the line break
+    # or before a closing brace of the C code around it.  Assembly comments run
+    # to the end of the line and may contain either.
+    while cursor < len(source):
+        if source.startswith(b"/*", cursor):
+            close = source.find(b"*/", cursor + 2)
+            if close < 0:
+                return None
+            cursor = close + 2
+            continue
+        if source.startswith(b";", cursor) or source.startswith(b"//", cursor):
+            newline = source.find(b"\n", cursor)
+            if newline < 0:
+                return None
+            if not block:
+                return newline
+            cursor = newline
+            continue
+        if source.startswith(b"}", cursor):
+            return cursor + 1 if block else cursor
+        if source.startswith(b"\n", cursor) and not block:
+            return cursor
+        cursor += 1
+    return None
 
 
 def walk(node):
