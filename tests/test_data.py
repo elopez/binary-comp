@@ -103,6 +103,27 @@ def test_compare_global_data_reports_mismatch(fixture_root, tmp_path):
     assert "Rebuilt value:  0x00000009 (9)" in format_comparison(summary)
 
 
+def test_compare_global_data_finds_named_globals_in_the_map(tmp_path):
+    from conftest import write_tiny_pe
+
+    original = tmp_path / "original.exe"
+    rebuilt = tmp_path / "rebuilt.exe"
+    globals_path = tmp_path / "globals.c"
+    map_path = tmp_path / "rebuilt.map"
+    write_tiny_pe(original, data_overrides={0x10: struct.pack("<I", 7)})
+    write_tiny_pe(rebuilt, data_overrides={0x18: struct.pack("<I", 7)})
+    globals_path.write_text("int nCount = 7; /* 0x00402010 */\n", encoding="utf-8")
+    map_path.write_text(" 0003:00000018       _nCount 00402018 globals.obj\n", encoding="utf-8")
+
+    summary = compare_global_data(
+        str(original), str(rebuilt), str(map_path), str(globals_path)
+    )
+
+    assert summary.missing_symbols == 0
+    assert summary.matches == 1
+    assert summary.comparisons[0].status == "OK"
+
+
 def test_compare_global_data_matches_anonymous_string_pointer(tmp_path):
     from conftest import DATA_VA, write_tiny_pe
 

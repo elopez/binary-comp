@@ -280,7 +280,17 @@ def compare_global_data(
                 address_map[decl.address] = va
         globals_list.sort(key=lambda decl: decl.address)
     else:
+        from binary_comp.analyzers.globals import rebuilt_symbol_indexes, rebuilt_va_for_decl
+
         globals_list = parse_globals_source(globals_path, extra_type_sizes)
+        # A global whose name does not encode its address is found under its
+        # own name in the map, as for LE images.
+        exact, by_address = rebuilt_symbol_indexes(map_path, globals_list)
+        for decl in globals_list:
+            if decl.address not in address_map:
+                va = rebuilt_va_for_decl(decl, exact, by_address)
+                if va is not None:
+                    address_map[decl.address] = va
     if not globals_list:
         raise ValueError(f"no addressed global definitions found in {globals_path}")
     inferred_address_map = infer_unmapped_data_addresses(
