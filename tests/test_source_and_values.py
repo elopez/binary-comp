@@ -656,6 +656,40 @@ def test_source_groups_include_c_files_and_map_to_obj(tmp_path):
     assert "module.obj" in entries_by_obj
 
 
+def test_source_groups_map_to_library_members(tmp_path):
+    source_dir = tmp_path / "src"
+    (source_dir / "ix").mkdir(parents=True)
+    (source_dir / "sound.c").write_text(
+        "/* Function start: 0x00401000 */\nint play_wave(void) { return 1; }\n",
+        encoding="utf-8",
+    )
+    (source_dir / "ix" / "sound.cpp").write_text(
+        "/* Function start: 0x00402000 */\nint ix_sound_start(void) { return 2; }\n",
+        encoding="utf-8",
+    )
+    (source_dir / "ix" / "streamer.cpp").write_text(
+        "/* Function start: 0x00403000 */\nint ix_streamer_init(void) { return 3; }\n",
+        encoding="utf-8",
+    )
+    map_path = tmp_path / "rebuilt.map"
+    map_path.write_text(
+        " 0001:00000000       _play_wave 00401000 f sound.obj\n"
+        " 0001:00001000       _ix_sound_start 00402000 f ixsound:sound.obj\n"
+        " 0001:00002000       _ix_streamer_init 00403000 f streamer:streamer.obj\n",
+        encoding="utf-8",
+    )
+
+    groups_by_source = load_source_groups((str(source_dir),))
+    mapped, missing, _ = map_source_groups(groups_by_source, str(map_path))
+
+    assert not missing
+    assert sorted((group.name, group.rebuilt_addr) for group in mapped) == [
+        ("ix_sound_start", 0x00402000),
+        ("ix_streamer_init", 0x00403000),
+        ("play_wave", 0x00401000),
+    ]
+
+
 def test_load_minimal_project_config(fixture_root):
     _, target = load_project_target(str(fixture_root / "binary-comp.json"), "full")
 

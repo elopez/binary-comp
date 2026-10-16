@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 from binary_comp.core.mapfile import MapEntry, parse_msvc_map_by_obj
@@ -64,6 +65,11 @@ def load_source_groups(
     return groups_by_source
 
 
+def object_member_name(object_file: str) -> str:
+    """Return the object a map line names: `lib:dir\\member.obj` -> `member.obj`."""
+    return re.split(r"[:\\/]", object_file)[-1]
+
+
 def map_source_groups(
     groups_by_source: dict[str, list[SourceFunctionGroup]],
     map_path: str,
@@ -77,12 +83,18 @@ def map_source_groups(
     missing: list[tuple[str, SourceFunctionGroup]] = []
 
     # Map files do not agree on case: MSVC echoes the object path as the build
-    # spelled it, Watcom upper-cases it.  Match on the folded name.
-    entries_by_folded = {key.lower(): value for key, value in entries_by_obj.items()}
+    # spelled it, Watcom upper-cases it, and a library member is listed as
+    # `library:member.obj`.  Match on the folded member name, pooling every
+    # object of that name; the function names tell them apart.
+    entries_by_member: dict[str, list[MapEntry]] = {}
+    for key, value in entries_by_obj.items():
+        entries_by_member.setdefault(object_member_name(key).lower(), []).extend(value)
+    for entries in entries_by_member.values():
+        entries.sort(key=lambda entry: entry.va)
 
     for source_path in sorted(groups_by_source):
         obj = os.path.splitext(os.path.basename(source_path))[0] + ".obj"
-        obj_entries = entries_by_obj.get(obj) or entries_by_folded.get(obj.lower(), [])
+        obj_entries = entries_by_member.get(obj.lower(), [])
         used: set[int] = set()
 
         for group in groups_by_source[source_path]:
