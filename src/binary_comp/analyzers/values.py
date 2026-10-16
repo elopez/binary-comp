@@ -17,6 +17,9 @@ from binary_comp.core.disasm import (
     full_register_name,
     has_msvc_seh_frame,
     is_branch_or_call,
+    next_boundary,
+    switch_jump_table_ranges,
+    trim_leading_stack_probe,
     unsigned32,
 )
 from binary_comp.core.ghidra import function_starts_from_export_dir
@@ -260,8 +263,57 @@ def load_original_boundary_starts(
     return sorted(starts)
 
 
+def leading_successor_switch_table_start(
+    image: PEImage,
+    start: int,
+    starts: set[int],
+    policy: VerifierPolicy,
+) -> int | None:
+    """Find a jump table emitted immediately before its owning function.
+
+    Watcom can place a function's switch table before the public function
+    symbol.  Without recognizing that ownership, the table is decoded as the
+    tail of the preceding function and can look like valid control flow by
+    accident.  The successor's own indirect jump and in-successor case targets
+    provide evidence for moving the comparison boundary to the table start.
+    """
+    ordered = sorted(starts)
+    successor_start = next_boundary(ordered, start)
+    if successor_start is None:
+        return None
+
+    section_end = image.section_end_for_va(successor_start)
+    if section_end is None:
+        return None
+    successor_end = next_boundary(ordered, successor_start)
+    if successor_end is None or successor_end > section_end:
+        successor_end = section_end
+    successor_end = min(successor_end, successor_start + policy.max_disassembly_bytes)
+    if successor_end <= successor_start:
+        return None
+
+    successor_instrs = disassemble_x86(
+        image,
+        successor_start,
+        ordered,
+        max_bytes=policy.max_disassembly_bytes,
+        padding_mnemonics=policy.padding_mnemonics,
+    )
+    ranges = switch_jump_table_ranges(
+        image,
+        successor_instrs,
+        successor_start,
+        successor_end,
+        table_bounds=(start, successor_start),
+    )
+    return min((lo for lo, _ in ranges), default=None)
+
+
 def disassemble(image: PEImage, start: int, starts: list[int], policy: VerifierPolicy) -> list[Instruction]:
     boundaries = set(starts)
+    leading_table = leading_successor_switch_table_start(image, start, boundaries, policy)
+    if leading_table is not None:
+        boundaries.add(leading_table)
     for _ in range(8):
         instructions = disassemble_x86(
             image,
@@ -270,6 +322,7 @@ def disassemble(image: PEImage, start: int, starts: list[int], policy: VerifierP
             max_bytes=policy.max_disassembly_bytes,
             padding_mnemonics=policy.padding_mnemonics,
         )
+        instructions = trim_leading_stack_probe(instructions)
         fragment = contiguous_tail_fragment_start(instructions, boundaries)
         if fragment is None:
             return instructions

@@ -125,6 +125,52 @@ def is_branch_or_call(mnemonic: str) -> bool:
     return mnemonic.startswith("j") or mnemonic in {"call", "loop", "loope", "loopne", "jecxz"}
 
 
+def trim_leading_stack_probe(instructions: list[Instruction]) -> list[Instruction]:
+    """Exclude a compiler-emitted Watcom stack-check prefix.
+
+    Watcom places ``push <frame size>; call __STK`` before the saved-register
+    prologue and publishes the symbol at the prefix.  Recovered function
+    boundaries commonly start at the developer body instead.  The run of
+    saved-register pushes followed by ``mov ebp, esp`` makes this conservative
+    enough not to discard an ordinary source-level call with one argument.
+    """
+    if len(instructions) < 6:
+        return instructions
+    frame_size, probe = instructions[:2]
+    if (
+        frame_size.mnemonic != "push"
+        or len(frame_size.operands) != 1
+        or frame_size.operands[0].kind != "imm"
+        or not (0 < frame_size.operands[0].imm <= 0x1000000)
+        or probe.mnemonic != "call"
+        or len(probe.operands) != 1
+        or probe.operands[0].kind != "imm"
+    ):
+        return instructions
+
+    saved_pushes = 0
+    for instruction in instructions[2:10]:
+        if (
+            instruction.mnemonic == "push"
+            and len(instruction.operands) == 1
+            and instruction.operands[0].kind == "reg"
+        ):
+            saved_pushes += 1
+            continue
+        if (
+            saved_pushes >= 3
+            and instruction.mnemonic == "mov"
+            and len(instruction.operands) == 2
+            and instruction.operands[0].kind == "reg"
+            and instruction.operands[1].kind == "reg"
+            and full_register_name(instruction.operands[0].reg) == "ebp"
+            and full_register_name(instruction.operands[1].reg) == "esp"
+        ):
+            return instructions[2:]
+        break
+    return instructions
+
+
 def next_boundary(starts: Iterable[int], start: int) -> int | None:
     for candidate in starts:
         if candidate > start:
@@ -417,40 +463,137 @@ def switch_jump_table_ranges(
     instrs: list[Instruction],
     func_start: int,
     func_end: int,
+    table_bounds: tuple[int, int] | None = None,
 ) -> tuple[tuple[int, int], ...]:
-    """Find MSVC switch tables embedded in a function body."""
+    """Find switch tables embedded in a function body.
+
+    Flat-memory compilers encode the table and its entries as virtual
+    addresses.  Segmented 32-bit compilers can instead use a CS override and
+    encode both as offsets from the current executable object's base.
+    """
+    table_start_bound, table_end_bound = table_bounds or (func_start, func_end)
     ranges: list[tuple[int, int]] = []
-    for instr in instrs:
+    for index, instr in enumerate(instrs):
         if instr.mnemonic != "jmp" or len(instr.operands) != 1:
             continue
 
         operand = instr.operands[0]
         if operand.kind != "mem":
             continue
-        if operand.base or not operand.index or operand.scale != 4:
+        indexed_by_four = not operand.base and bool(operand.index) and operand.scale == 4
+        shifted_base = False
+        if operand.base and not operand.index and operand.scale == 1:
+            base = full_register_name(operand.base)
+            for previous in instrs[max(0, index - 3):index]:
+                if (
+                    previous.mnemonic == "shl"
+                    and len(previous.operands) == 2
+                    and previous.operands[0].kind == "reg"
+                    and full_register_name(previous.operands[0].reg) == base
+                    and previous.operands[1].kind == "imm"
+                    and previous.operands[1].imm == 2
+                ):
+                    shifted_base = True
+        if not indexed_by_four and not shifted_base:
             continue
 
+        dispatch_register = full_register_name(operand.index or operand.base)
+
+        segment_base = 0
         table_start = unsigned32(operand.disp)
-        if not (func_start <= table_start < func_end):
+        if "cs:" in instr.op_str.lower():
+            owner = getattr(image, "object_for_va", lambda _address: None)(instr.address)
+            if owner is not None:
+                relative_start = owner.base + table_start
+                if table_start_bound <= relative_start < table_end_bound:
+                    segment_base = owner.base
+                    table_start = relative_start
+        if not (table_start_bound <= table_start < table_end_bound):
             continue
 
-        table_end = switch_jump_table_end(image, table_start, func_start, func_end)
+        upper_bound = previous_cmp_upper_bound(instrs, index, dispatch_register)
+        table_end = None
+        if upper_bound is not None:
+            table_end = bounded_switch_jump_table_end(
+                image,
+                table_start,
+                table_end_bound,
+                upper_bound + 1,
+                instr.address,
+                segment_base,
+            )
+        if table_end is None:
+            table_end = switch_jump_table_end(
+                image,
+                table_start,
+                table_end_bound,
+                func_start,
+                func_end,
+                segment_base,
+            )
         if table_end is not None:
             ranges.append((table_start, table_end))
 
-    ranges.extend(switch_byte_map_ranges(instrs, func_start, func_end))
+    ranges.extend(switch_byte_map_ranges(instrs, table_start_bound, table_end_bound))
     return merge_ranges(ranges)
 
 
-def switch_jump_table_end(image: PEImage, table_start: int, func_start: int, func_end: int) -> int | None:
+def same_code_region(image: PEImage, source: int, target: int) -> bool:
+    """Whether two addresses belong to the same executable image region."""
+    object_for_va = getattr(image, "object_for_va", None)
+    if object_for_va is not None:
+        source_object = object_for_va(source)
+        target_object = object_for_va(target)
+        return source_object is not None and target_object is not None and \
+            source_object.index == target_object.index
+
+    section_for_va = getattr(image, "section_for_va", None)
+    if section_for_va is None:
+        return False
+    source_section = section_for_va(source)
+    target_section = section_for_va(target)
+    return source_section is not None and target_section is not None and \
+        source_section.start == target_section.start and \
+        bool(source_section.flags & 0x20000000)
+
+
+def bounded_switch_jump_table_end(
+    image: PEImage,
+    table_start: int,
+    table_end_bound: int,
+    entry_count: int,
+    dispatch_address: int,
+    segment_base: int = 0,
+) -> int | None:
+    """Validate a compare-bounded table, including shared-tail targets."""
+    if entry_count <= 0 or table_start + entry_count * 4 > table_end_bound:
+        return None
+    for entry in range(entry_count):
+        raw = image.read(table_start + entry * 4, 4)
+        if raw is None or len(raw) != 4:
+            return None
+        target = struct.unpack("<I", raw)[0] + segment_base
+        if not same_code_region(image, dispatch_address, target):
+            return None
+    return table_start + entry_count * 4
+
+
+def switch_jump_table_end(
+    image: PEImage,
+    table_start: int,
+    table_end_bound: int,
+    target_start: int,
+    target_end: int,
+    segment_base: int = 0,
+) -> int | None:
     cursor = table_start
     entries = 0
-    while cursor + 4 <= func_end:
+    while cursor + 4 <= table_end_bound:
         raw = image.read(cursor, 4)
         if raw is None or len(raw) != 4:
             break
-        target = struct.unpack("<I", raw)[0]
-        if not (func_start <= target < func_end):
+        target = struct.unpack("<I", raw)[0] + segment_base
+        if not (target_start <= target < target_end):
             break
         entries += 1
         cursor += 4
