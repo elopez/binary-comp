@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 
 from binary_comp.analyzers.function_compare import (
@@ -16,9 +17,12 @@ from binary_comp.analyzers.function_compare import (
     maybe_build,
     mnemonic_similarity,
 )
+from binary_comp.analyzers.byte_compare import ByteComparison, compare_function_bytes
 from binary_comp.analyzers.calls import asm_path_for_source as calls_asm_path_for_source
 from binary_comp.config import ProjectTarget
 from binary_comp.core.disasm import normalize_mnemonic
+from binary_comp.core.ghidra import function_starts_from_export_dir
+from binary_comp.core.mapfile import function_starts_from_map
 from binary_comp.core.pe import PEImage
 from binary_comp.source.functions import load_source_groups
 
@@ -29,6 +33,7 @@ class SimilarityReportOptions:
     canonical_aliases: dict[str, str] | None = None
     file_filter: str | None = None
     signature_overloads: frozenset[str] = frozenset()
+    compare_bytes: bool = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,7 @@ class SimilarityReportRow:
     address: int
     similarity: float | None
     status: str
+    bytes: ByteComparison | None = None
 
 
 @dataclass(frozen=True)
@@ -187,6 +193,28 @@ def generate_similarity_report(
     original_image = PEImage(target.original_exe)
     max_bytes, padding_mnemonics = load_disassembly_policy(target)
     groups_by_source = load_source_groups(target.source_dirs, target.map_skip, target.source_excludes)
+
+    original_starts = function_starts_from_export_dir(target.code_dir) if options.compare_bytes else []
+    rebuilt_starts = function_starts_from_map(comparer.map_entries()) if options.compare_bytes else []
+
+    def next_start(starts: list[int], address: int) -> int | None:
+        index = bisect_right(starts, address)
+        return starts[index] if index < len(starts) else None
+
+    def byte_comparison(comparison) -> ByteComparison | None:
+        if not options.compare_bytes or not comparison.original.instructions or not comparison.rebuilt.instructions:
+            return None
+        original_last = max(instr.address for instr in comparison.original.instructions)
+        rebuilt_last = max(instr.address for instr in comparison.rebuilt.instructions)
+        return compare_function_bytes(
+            original_image,
+            comparison.original.instructions,
+            comparer.pe_image(target.rebuilt_exe),
+            comparison.rebuilt.instructions,
+            original_end=next_start(original_starts, original_last),
+            rebuilt_end=next_start(rebuilt_starts, rebuilt_last),
+        )
+
     rows: list[SimilarityReportRow] = []
     compared = 0
     similarity_sum = 0.0
@@ -286,6 +314,7 @@ def generate_similarity_report(
                                 address,
                                 similarity,
                                 f"{similarity:.2f}%",
+                                byte_comparison(comparison),
                             ))
                         continue
 
@@ -311,6 +340,7 @@ def generate_similarity_report(
                             entry_address,
                             similarity,
                             f"{similarity:.2f}%",
+                            byte_comparison(comparison),
                         ))
                     continue
                 # fall through to per-chunk handling if a chunk's disasm is missing
@@ -323,6 +353,7 @@ def generate_similarity_report(
                     rows.append(SimilarityReportRow(source_file, group.name, address, None, "MISSING ASM"))
                     continue
 
+                comparison = None
                 try:
                     comparison = comparer.compare(group.name, path, build=False)
                 except (FunctionCompareError, FileNotFoundError, RuntimeError, ValueError):
@@ -359,6 +390,7 @@ def generate_similarity_report(
                     address,
                     similarity,
                     f"{similarity:.2f}%",
+                    byte_comparison(comparison) if comparison is not None else None,
                 ))
 
     return SimilarityReport(
@@ -405,7 +437,10 @@ def format_similarity_report(
         if row.source_file != current_file:
             lines.extend(["", f"=== {row.source_file} ==="])
             current_file = row.source_file
-        lines.append(f"  {row.function_name:45s} 0x{row.address:06X}  {row.status}")
+        line = f"  {row.function_name:45s} 0x{row.address:06X}  {row.status}"
+        if row.bytes is not None:
+            line = f"{line:<70s} {row.bytes.label}"
+        lines.append(line)
 
     average = report.similarity_sum / report.compared if report.compared else 0.0
     lines.extend([
@@ -420,6 +455,18 @@ def format_similarity_report(
         f"  ASM fallback: {report.asm_fallbacks}",
         f"  Average similarity: {average:.2f}%",
     ])
+    compared_bytes = [row.bytes for row in report.rows if row.bytes is not None]
+    if compared_bytes:
+        exact = sum(1 for item in compared_bytes if item.exact)
+        same_size = sum(1 for item in compared_bytes if item.same_size and not item.exact)
+        resized = [item for item in compared_bytes if not item.same_size]
+        delta = sum(item.rebuilt_size - item.original_size for item in resized)
+        lines.extend([
+            f"Byte comparison: {len(compared_bytes)}",
+            f"  Exact: {exact}",
+            f"  Same size, different bytes: {same_size}",
+            f"  Different size: {len(resized)} (net {delta:+d} bytes)",
+        ])
     if reasons is not None:
         lines.extend(["", "--- Recorded reasons for similarity below 90% ---"])
         below = sorted(

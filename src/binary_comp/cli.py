@@ -484,6 +484,8 @@ def add_report_parser(subparsers) -> None:
     parser.add_argument("--filter", dest="file_filter", help="Only include matching source files or function names")
     parser.add_argument("--reasons", metavar="CSV", help="Append recorded reasons for scores below 90%%")
     parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary and map")
+    parser.add_argument("--bytes", action="store_true",
+                        help="Also compare encoded bytes: EXACT, BYTES differing/total, or SIZE delta")
     parser.set_defaults(handler=run_report)
 
 
@@ -1192,6 +1194,7 @@ def run_report(args) -> int:
             canonical_aliases=extract_canonical_aliases(config),
             file_filter=args.file_filter,
             signature_overloads=extract_signature_overloads(config),
+            compare_bytes=args.bytes,
         )
         if target.kind in ("dos16-omf", "dos32-omf"):
             report = generate_omf_similarity_report(config, args.config, target, options)

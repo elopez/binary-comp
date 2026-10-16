@@ -326,6 +326,7 @@ binary-comp calls --config path/to/binary-comp.json --target full --fail-on-mism
 binary-comp global-access --config path/to/binary-comp.json --target full --include-address-immediates
 binary-comp report --config path/to/binary-comp.json --target full
 binary-comp report --config path/to/binary-comp.json --target full --reasons reasons.csv
+binary-comp report --config path/to/binary-comp.json --target full --bytes
 binary-comp order --config path/to/binary-comp.json --target full --no-build
 binary-comp vtables --config path/to/binary-comp.json --target full --dump
 binary-comp seh --config path/to/binary-comp.json --target full --report
@@ -444,6 +445,15 @@ point back into the function appears as `dd`/`dw` entries instead of being
 decoded as instructions. LE/LX originals supply the entries' final addresses
 from their fixup records. For a strict byte gate use
 `omf-compare --config ... --target sample`, optionally `--function CheckSlot`.
+
+Mnemonic similarity cannot see registers, operands or encodings, so for PE
+targets `report --bytes` also compares each function's encoded bytes over its
+whole span: the code, the tables the compiler placed after it, and the padding
+up to the next function. Fields that base relocations patch compare by
+position, and a branch compares by its target's offset into the function, or
+not at all when it leaves it. Each row gains `EXACT`, `BYTES differing/total`
+or `SIZE ±n`, and the summary counts exact functions and the net size drift,
+which is what moves every later address.
 It checks all selected entries and returns nonzero on byte/length, fixup-layout,
 or literal differences. Config commands build by default; use `--no-build`
 when Make has already built the objects. Mnemonic similarity alone can remain

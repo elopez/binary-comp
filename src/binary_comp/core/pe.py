@@ -50,6 +50,13 @@ class PEImage:
         self.image_base = struct.unpack_from("<I", self.data, optional_header + 28)[0]
         self.entry_point = self.image_base + entry_point_rva
 
+        # Data directory 5 holds the base relocations (PE32 directories start
+        # 96 bytes into the optional header).
+        self._reloc_directory = (0, 0)
+        if optional_size >= 96 + 6 * 8:
+            self._reloc_directory = struct.unpack_from("<II", self.data, optional_header + 96 + 5 * 8)
+        self._relocations: frozenset[int] | None = None
+
         self.sections: list[Section] = []
         section_table = optional_header + optional_size
         for index in range(section_count):
@@ -60,6 +67,25 @@ class PEImage:
             start = self.image_base + rva
             end = start + max(virtual_size, raw_size)
             self.sections.append(Section(name, start, end, raw_pointer, raw_size, virtual_size, flags))
+
+    def relocations(self) -> frozenset[int]:
+        """VAs of the dwords that IMAGE_REL_BASED_HIGHLOW relocations patch."""
+        if self._relocations is None:
+            found: set[int] = set()
+            rva, size = self._reloc_directory
+            table = self.read(self.image_base + rva, size) if rva and size else None
+            cursor = 0
+            while table and cursor + 8 <= len(table):
+                page, block_size = struct.unpack_from("<II", table, cursor)
+                if block_size < 8:
+                    break
+                for entry_at in range(cursor + 8, min(cursor + block_size, len(table)) - 1, 2):
+                    entry = struct.unpack_from("<H", table, entry_at)[0]
+                    if entry >> 12 == 3:
+                        found.add(self.image_base + page + (entry & 0xFFF))
+                cursor += block_size
+            self._relocations = frozenset(found)
+        return self._relocations
 
     def section_for_va(self, va: int) -> Section | None:
         for section in self.sections:
