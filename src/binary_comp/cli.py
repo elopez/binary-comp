@@ -94,7 +94,7 @@ from binary_comp.analyzers.report import (
 )
 from binary_comp.analyzers.values import ValuesOptions, check_values, format_summary, load_policy
 from binary_comp.analyzers.vtables import VtableOptions, check_vtables, format_vtable_summary
-from binary_comp.config import ConfigError, DEFAULT_CONFIG_PATH, ProjectTarget, load_project_target, parse_int
+from binary_comp.config import ConfigError, DEFAULT_CONFIG_PATH, ProjectTarget, load_json, load_project_target, parse_int
 from binary_comp.source.functions import load_source_groups, map_source_groups
 from binary_comp.core.binary import (
     analyze_word_delta,
@@ -219,9 +219,11 @@ def add_compare_parser(subparsers) -> None:
     parser.add_argument(
         "disassembled_code",
         nargs="?",
-        help="Path to the Ghidra-style disassembly export; omitted for OMF/TPU targets",
+        help="Path to the Ghidra-style disassembly export; omitted for COFF/OMF/TPU targets",
     )
-    parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary and map")
+    parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary/map or COFF objects")
+    parser.add_argument("--module", action="append", help="Limit an i386-coff comparison to named modules")
+    parser.add_argument("--output", default="binary-comp-report", help="i386-coff JSON/text/review output directory")
     parser.set_defaults(handler=run_compare)
 
 
@@ -483,9 +485,11 @@ def add_report_parser(subparsers) -> None:
     parser.add_argument("--target", default="full", help="Target name from config (default: full)")
     parser.add_argument("--filter", dest="file_filter", help="Only include matching source files or function names")
     parser.add_argument("--reasons", metavar="CSV", help="Append recorded reasons for scores below 90%%")
-    parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary and map")
+    parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary/map or COFF objects")
     parser.add_argument("--bytes", action="store_true",
                         help="Also compare encoded bytes: EXACT, BYTES differing/total, or SIZE delta")
+    parser.add_argument("--module", action="append", help="Limit an i386-coff report to named modules")
+    parser.add_argument("--output", default="binary-comp-report", help="i386-coff JSON/text/review output directory")
     parser.set_defaults(handler=run_report)
 
 
@@ -870,8 +874,30 @@ def run_data(args) -> int:
     return 0 if summary.mismatches == 0 and summary.missing_symbols == 0 else 1
 
 
+def coff_target_selection(config_path: str, target_name: str) -> bool:
+    """Select the object backend before PE-only target fields are required."""
+    targets = load_json(config_path).get("targets", {})
+    if not isinstance(targets, dict):
+        raise ConfigError("targets must be an object")
+    selected = targets.values() if target_name == "all" else (targets.get(target_name),)
+    return any(isinstance(item, dict) and item.get("kind") == "i386-coff" for item in selected)
+
+
+def invalidate_report_summaries(output: str | None) -> None:
+    """A failed CLI selection must not leave an older successful summary."""
+    if output is not None:
+        for filename in ("report.json", "report.txt"):
+            (Path(output) / filename).unlink(missing_ok=True)
+
+
 def run_compare(args) -> int:
     try:
+        invalidate_report_summaries(getattr(args, "output", None))
+        if coff_target_selection(args.config, args.target):
+            from binary_comp.analyzers.coff_report import run_config
+
+            return run_config(args.config, args.target, args.output, module_names=args.module,
+                              function_name=args.function_name, build=not args.no_build, show_reviews=True)
         config, target = load_project_target(args.config, args.target)
         if target.kind in ("dos16-omf", "dos32-omf"):
             maybe_build(target, not args.no_build)
@@ -920,7 +946,7 @@ def run_compare(args) -> int:
                 args.disassembled_code,
                 build=not args.no_build,
             )
-    except (ConfigError, FileNotFoundError, RuntimeError, ValueError, FunctionCompareError) as exc:
+    except (ConfigError, OSError, RuntimeError, ValueError, FunctionCompareError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
@@ -1187,7 +1213,13 @@ def run_exe(args) -> int:
 
 def run_report(args) -> int:
     try:
+        invalidate_report_summaries(getattr(args, "output", None))
         reasons = load_similarity_reasons(args.reasons) if args.reasons is not None else None
+        if coff_target_selection(args.config, args.target):
+            from binary_comp.analyzers.coff_report import run_config
+
+            return run_config(args.config, args.target, args.output, module_names=args.module,
+                              file_filter=args.file_filter, build=not args.no_build)
         config, target = load_project_target(args.config, args.target)
         options = SimilarityReportOptions(
             build=not args.no_build,

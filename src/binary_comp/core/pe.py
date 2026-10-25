@@ -159,3 +159,71 @@ class PEImage:
         if predicate is not None and not predicate(text):
             return None
         return text
+
+
+def decode_rich_records(data: bytes) -> list[dict[str, int]]:
+    """Decode Rich product/build/count provenance from the DOS header region.
+
+    These are contributing object/tool records, not a function census or proof
+    of a complete project's compiler flags. An absent Rich header returns [].
+    """
+    if len(data) < 0x40:
+        raise ValueError("Truncated DOS header")
+    peoff = struct.unpack_from("<I", data, 0x3C)[0]
+    if peoff > len(data):
+        raise ValueError("Truncated PE header")
+    end = data.find(b"Rich", 0x40, peoff)
+    if end < 0:
+        return []
+    if end % 4 or end + 8 > peoff:
+        raise ValueError("Malformed Rich header")
+    key = struct.unpack_from("<I", data, end + 4)[0]
+    decoded = b"".join(struct.pack("<I", struct.unpack_from("<I", data, pos)[0] ^ key)
+                       for pos in range(0, end, 4))
+    start = decoded.find(b"DanS")
+    if start < 0 or start % 4 or start + 16 > end or (end - start - 16) % 8:
+        raise ValueError("Malformed Rich header")
+    return [{"product": struct.unpack_from("<I", decoded, pos)[0] >> 16,
+             "build": struct.unpack_from("<I", decoded, pos)[0] & 65535,
+             "count": struct.unpack_from("<I", decoded, pos + 4)[0]}
+            for pos in range(start + 16, end, 8)]
+
+
+class FileBackedPEImage(PEImage):
+    """i386 PE32 reference whose reads require complete file-backed windows.
+
+    PEImage continues to expose the loader view, including zero-filled BSS.
+    Strict comparisons use this opt-in subclass to reject those synthetic
+    bytes, invalid raw bounds and incomplete reads instead.
+    """
+
+    def __init__(self, path: str):
+        try:
+            super().__init__(str(path))
+        except struct.error as exc:
+            raise ValueError("Truncated PE headers") from exc
+        peoff = struct.unpack_from("<I", self.data, 0x3C)[0]
+        optional = peoff + 24
+        machine = struct.unpack_from("<H", self.data, peoff + 4)[0]
+        magic = struct.unpack_from("<H", self.data, optional)[0]
+        if machine != 0x14C or magic != 0x10B:
+            raise ValueError("Expected i386 PE32 image")
+        self.linker = tuple(self.data[optional + 2:optional + 4])
+        for section in self.sections:
+            if section.rawptr + section.rawsize > len(self.data):
+                raise ValueError(f"Truncated PE section {section.name}")
+
+    def read(self, va: int, size: int) -> bytes:
+        if size < 0:
+            raise ValueError("Negative read size")
+        for section in self.sections:
+            if section.start <= va and va + size <= section.start + section.rawsize:
+                offset = section.rawptr + va - section.start
+                result = self.data[offset:offset + size]
+                if len(result) == size:
+                    return result
+                break
+        raise ValueError(f"VA {va:#x}+{size:#x} has no complete file-backed section")
+
+    def rich_records(self) -> list[dict[str, int]]:
+        return decode_rich_records(self.data)

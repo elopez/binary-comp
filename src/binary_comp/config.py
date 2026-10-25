@@ -53,6 +53,8 @@ class ProjectTarget:
     values_policy: str | None = None
     kind: str = "pe"
     preprocessor: PreprocessorConfig = PreprocessorConfig()
+    original_sha256: str | None = None
+    object_dir: str | None = None
 
 
 def load_json(path: str | os.PathLike[str] | None) -> dict[str, Any]:
@@ -234,7 +236,7 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
         raise ConfigError(f"targets.{target}.values must be an object")
 
     policy = optional_string(values, "policy") or optional_string(policies, "values")
-    source_dirs = _required_source_dirs(
+    source_dirs = (_source_dirs if kind == "i386-coff" else _required_source_dirs)(
         target_cfg.get("source_dirs") or target_cfg.get("source_dir"),
         f"targets.{target}.source_dirs",
     )
@@ -242,7 +244,7 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
         target_cfg.get("source_excludes") or target_cfg.get("source_exclude"),
         f"targets.{target}.source_excludes",
     )
-    if kind in ("dos16-omf", "dos32-omf", "dos16-tpu"):
+    if kind in ("dos16-omf", "dos32-omf", "dos16-tpu", "i386-coff"):
         rebuilt_exe = _resolve_standalone_path(optional_string(target_cfg, "rebuilt_exe"), base) or ""
         map_path = _resolve_standalone_path(optional_string(target_cfg, "map"), base) or ""
     else:
@@ -292,6 +294,8 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
             target_cfg.get("preprocessor", config.get("preprocessor")),
             f"targets.{target}.preprocessor" if "preprocessor" in target_cfg else "preprocessor",
         ),
+        original_sha256=optional_string(target_cfg, "original_sha256"),
+        object_dir=_resolve_standalone_path(optional_string(target_cfg, "object_dir"), base),
     )
 
 

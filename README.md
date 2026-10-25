@@ -184,6 +184,89 @@ Relative paths are resolved from the config file directory. A copy of the
 minimum shape is kept at
 [`examples/minimal-binary-comp.json`](examples/minimal-binary-comp.json).
 
+### Native i386 COFF comparisons
+
+The existing `compare` and `report` commands also accept caller-built i386 COFF
+objects. A COFF target needs an original PE32 image, its SHA-256 digest and an
+object directory; rebuilt executables, linker maps, source annotations and
+disassembly exports are unnecessary. Compilation stays in your build system.
+
+```json
+{
+  "targets": {
+    "retail": {
+      "kind": "i386-coff",
+      "original_exe": "original.exe",
+      "original_sha256": "<64 hexadecimal SHA-256 characters>",
+      "object_dir": "build/retail"
+    }
+  },
+  "coff": {"modules": "modules.json", "source_root": "."}
+}
+```
+
+The shared module manifest is a JSON list. Target names such as `retail` and
+`debug` select the matching extent and bindings dynamically. An object is loaded
+from `object_dir/<module name>.obj`. For example:
+
+```json
+[
+  {
+    "name": "Sample",
+    "source": "src/sample.cpp",
+    "functions": [
+      {"label": "read_value", "symbol": "_read_value",
+       "retail": {"va": "0x401000", "size": 6}}
+    ],
+    "bindings": {
+      "retail": {"_number": {"va": "0x402010", "data_size": 4}}
+    }
+  }
+]
+```
+
+`source` is an optional provenance label. Readable sources are hashed relative
+to `coff.source_root`, which defaults to the config directory. All paths in the
+configuration, including `source_root`, are relative to that directory. Original
+images and actual object bytes are always hashed. Build commands may be supplied
+through the existing target `build` settings; `--no-build` reads existing objects.
+
+```sh
+binary-comp report --config binary-comp.json --target all --no-build --output build/report
+binary-comp report --config binary-comp.json --target retail --module Sample --no-build
+binary-comp compare --config binary-comp.json --target retail read_value --no-build
+```
+
+`--target all` aggregates configured COFF targets into one report. `--module`
+may be repeated. `--output` names the directory for `report.json`, `report.txt`
+and complete per-body byte/disassembly reviews; `compare` also prints the review.
+A COFF report always checks raw bytes and bytes after explicitly bound DIR32 or
+REL32 fixups separately. Any code, extent, data or decode failure produces a
+nonzero exit status. Mnemonic similarity remains diagnostic, and the existing
+PE relocation-normalized `report --bytes` mode is unchanged.
+
+Every code entry requires its complete original extent. Compiler EH entries
+belong in a separate `code_labels` list with the same shape. Complete data
+definitions use `data_size` or `data_hex`; defined data referenced by code must
+have one of these complete bindings. Unknown targets, unsupported relocations,
+weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
+Identical source aliases can remain address bindings while a single canonical
+body is listed in `functions`. Each object can count a symbol only once; local
+symbol names may repeat in other objects. Original code windows must be unique
+and nonoverlapping across modules and roles for each target. Native
+function symbols belong in `functions`; native compiler code labels belong in
+`code_labels`. Local case labels inside a function are never separate entries.
+
+Native pointer tables in a code section require `inline_data: true` and a
+complete `data_size`; local case labels need their explicit original addresses.
+A following byte-index table also declares `inline_index_for` naming its pointer
+table. Native offsets, contiguous pointer fixups, index values, the complete
+table suffix and bounded alignment are validated. Tables are counted as data,
+excluded from instruction metrics. Known instruction alignment inside the
+configured code extent remains checked. Rejected extents may receive full
+diagnostic reviews, but their failure remains visible and excluded from exact
+totals. These object comparisons do not establish whole-executable equality.
+
 ### Conditional Compilation
 
 Sources that keep a port beside the original code often split one statement
