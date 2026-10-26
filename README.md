@@ -299,6 +299,18 @@ and nonoverlapping across modules and roles for each target. Native
 function symbols belong in `functions`; native compiler code labels belong in
 `code_labels`. Local case labels inside a function are never separate entries.
 
+A report also requires one configured VA per native external name within each
+selected target. This covers native storage-class 2 records for defined data or
+code, COMMON contributions and pure undefined references, including addresses
+added by code entries and external records in explicit COMMON providers.
+Conflicts identify the symbol and both modules and invalidate the report.
+Static/local names remain object-specific; weak names and absolute/debug
+records are excluded. Resolved strong fallback names are checked under their
+own native external identity. Different names may share a VA, and different
+targets are independent. The check covers only selected modules and their
+explicit providers: filtering, single-module comparisons and candidate scoring
+do not establish consistency with unselected objects or whole-link resolution.
+
 Native pointer tables in a code section require `inline_data: true` and a
 complete `data_size`; local case labels need their explicit original addresses.
 Code sections with inline tables still require exactly one typed function

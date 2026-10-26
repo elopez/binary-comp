@@ -426,6 +426,28 @@ def validate_native_role(coff, symbol, kind):
         coff.function(symbol)
 
 
+def register_external_bindings(seen, coff, bindings, version, owner):
+    """Keep selected objects' native external address assertions consistent.
+
+    Weak names and absolute/debug records do not identify ordinary external
+    addresses. A resolved strong fallback is checked under its own native name.
+    """
+    for name, binding in bindings.items():
+        symbol = coff.named.get(name)
+        if symbol is None or symbol["storage"] != 2 or symbol["section"] < 0:
+            continue
+        if symbol["section"] > len(coff.sections):
+            raise ValueError(f"Invalid native external section for {owner}:{name}")
+        address = int(binding["va"], 16)
+        if not 0 <= address <= 0xFFFFFFFF:
+            raise ValueError(f"External binding outside i386 address domain: {owner}:{name}")
+        previous = seen.get(name)
+        if previous is not None and previous[0] != address:
+            raise ValueError(f"Conflicting external binding for {version} {name}: "
+                             f"{previous[1]}={previous[0]:#x}, {owner}={address:#x}")
+        seen[name] = address, owner
+
+
 def report(modules, targets, versions, output, *, manifest_path=None, source_root=None):
     rows, data_rows = [], []
     output = Path(output)
@@ -438,6 +460,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         (output / filename).unlink(missing_ok=True)
     validate_counted_code(modules, versions)
     for version in versions:
+        external_bindings = {}
         target_config = targets[version]
         reference, actual_hash = load_reference(target_config, version)
         reference_hashes[version] = actual_hash
@@ -456,6 +479,11 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
                                       [f for _, f in entries], version)
             validate_common_definitions(coff, bindings, reference, common_definitions)
+            register_external_bindings(external_bindings, coff, bindings, version, module["name"])
+            for name, provider in common_definitions.items():
+                filename = module["common_definitions"][version][name]
+                register_external_bindings(external_bindings, provider, bindings, version,
+                                           f"{module['name']} provider {filename}")
             for kind, function in entries:
                 target = function[version]
                 row = {"version": version, "module": module["name"], "kind": kind,
@@ -529,6 +557,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "diagnostic_only": "Rejected extents compare the COFF section, or its code prefix before validated inline data, including padding; the strict gate error remains a failure",
             "mnemonic_similarity": "binary-comp normalized linear mnemonic Levenshtein score; ignores all operands",
             "data": "Complete configured COFF definitions, including native inline tables and sectionless COMMON contributions with logical zeros or explicitly selected strong providers, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
+            "external_bindings": "Native storage-2 external address bindings agree by name within each selected target across selected modules and explicit COMMON providers; excludes static/local, weak, absolute and debug records; no claim about unselected objects or whole-link resolution",
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
         "inputs": {
