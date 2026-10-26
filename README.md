@@ -272,6 +272,30 @@ is checked and decoded there. Rejected extents may receive full
 diagnostic reviews, but their failure remains visible and excluded from exact
 totals. These object comparisons do not establish whole-executable equality.
 
+External source searches can score a candidate object without replacing the
+configured object or generating a report:
+
+```sh
+binary-comp compare read_value --config binary-comp.json --target retail --module Sample --no-build --score --object candidate.obj
+```
+
+`--score` prints a single nonnegative integer and exits successfully for a valid
+comparison, including a code mismatch. The score counts differing byte positions
+after explicit COFF fixups. Zero requires the complete native function to pass
+the strict extent and byte gate, plus every configured data definition, including
+unreferenced data. This establishes relocation-corrected equality; raw object
+bytes may differ at relocation operands. No operand masks or mnemonic similarity
+contribute to the score. Rejected extents use the complete diagnostic code window
+and a minimum score of one; they can never count as exact.
+
+Scoring requires `--object`, explicit `--no-build`, one target (not `all`), one
+selected module and one native function. `code_labels`, ambiguous selections,
+disassembly exports and `--output` are rejected. Invalid objects, references,
+bindings, relocations or configured data exit with status 2, an error on stderr
+and no score on stdout. The mode does not build, decode instructions, write or
+invalidate reports, or modify its inputs. `--object` is accepted only with
+`--score`.
+
 ### Conditional Compilation
 
 Sources that keep a port beside the original code often split one statement

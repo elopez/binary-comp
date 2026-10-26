@@ -223,7 +223,9 @@ def add_compare_parser(subparsers) -> None:
     )
     parser.add_argument("--no-build", action="store_true", help="Use existing rebuilt binary/map or COFF objects")
     parser.add_argument("--module", action="append", help="Limit an i386-coff comparison to named modules")
-    parser.add_argument("--output", default="binary-comp-report", help="i386-coff JSON/text/review output directory")
+    parser.add_argument("--output", help="i386-coff JSON/text/review output directory (default: binary-comp-report)")
+    parser.add_argument("--score", action="store_true", help="Print one strict i386-coff candidate score; requires --no-build and --object")
+    parser.add_argument("--object", dest="object_path", help="Candidate i386-coff object for --score")
     parser.set_defaults(handler=run_compare)
 
 
@@ -892,11 +894,24 @@ def invalidate_report_summaries(output: str | None) -> None:
 
 def run_compare(args) -> int:
     try:
-        invalidate_report_summaries(getattr(args, "output", None))
+        if args.score:
+            from binary_comp.analyzers.coff_report import score_config
+
+            if not args.no_build or not args.object_path:
+                raise ConfigError("--score requires --no-build and --object")
+            if args.disassembled_code or args.output is not None:
+                raise ConfigError("--score does not accept disassembled_code or --output")
+            print(score_config(args.config, args.target, args.function_name, args.object_path,
+                               module_names=args.module))
+            return 0
+        if args.object_path:
+            raise ConfigError("--object requires --score")
+        output = args.output or "binary-comp-report"
+        invalidate_report_summaries(output)
         if coff_target_selection(args.config, args.target):
             from binary_comp.analyzers.coff_report import run_config
 
-            return run_config(args.config, args.target, args.output, module_names=args.module,
+            return run_config(args.config, args.target, output, module_names=args.module,
                               function_name=args.function_name, build=not args.no_build, show_reviews=True)
         config, target = load_project_target(args.config, args.target)
         if target.kind in ("dos16-omf", "dos32-omf"):

@@ -33,6 +33,18 @@ def target_value(target, name):
     return value
 
 
+def load_reference(target, version):
+    """Check the configured original digest before reading any comparison window."""
+    path = Path(target_value(target, "original_exe"))
+    expected_hash = target_value(target, "original_sha256")
+    actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+        raise ValueError(f"Target {version} needs an original_sha256 digest")
+    if actual_hash != expected_hash.lower():
+        raise ValueError(f"Original SHA-256 mismatch for {version}: {path}")
+    return PE(path), actual_hash
+
+
 def source_hashes(modules, source_root):
     """Source labels are optional; objects and references are always hashed."""
     if source_root is None:
@@ -229,8 +241,8 @@ def compare_windows(label, address, original, raw, relocated):
     return result, "\n\n".join(review) + "\n"
 
 
-def diagnostic_window(coff, section, function, version, bindings, reference):
-    """Review a rejected code extent, keeping explicitly validated native data separate."""
+def diagnostic_bytes(coff, section, function, version, bindings, reference):
+    """Relocate a rejected complete code window without disassembly or report output."""
     target = function[version]
     address, size = int(target["va"], 16), target["size"]
     original = reference.read(address, size)
@@ -244,6 +256,15 @@ def diagnostic_window(coff, section, function, version, bindings, reference):
     raw = window["data"]
     rebuilt, fixups = apply_fixups(coff, raw, window["relocations"], address,
                                   bindings, reference)
+    return window, original, rebuilt, fixups
+
+
+def diagnostic_window(coff, section, function, version, bindings, reference):
+    """Review a rejected code extent, keeping explicitly validated native data separate."""
+    window, original, rebuilt, fixups = diagnostic_bytes(
+        coff, section, function, version, bindings, reference)
+    address, size = int(function[version]["va"], 16), function[version]["size"]
+    raw = window["data"]
     metrics, review = compare_windows(function["label"], address, original, raw, rebuilt)
     inline = "inline_data_bytes" in window
     description = ("complete COFF code prefix before validated inline data" if inline
@@ -259,6 +280,49 @@ def diagnostic_window(coff, section, function, version, bindings, reference):
                        inline_alignment_bytes=window["inline_alignment_bytes"],
                        inline_data_symbols=window["inline_data_symbols"])
     return metrics, note + "\n\n" + review
+
+
+def score_config(config_path, target_name, function_name, object_path, *, module_names=None):
+    """Score one external candidate with zero reserved for the complete strict gate.
+
+    Valid code differences return positional byte differences after explicit
+    fixups. Rejected extents use the diagnostic window and a positive minimum;
+    invalid configuration, native roles, data or fixups remain errors.
+    """
+    from binary_comp.core.binary import compare_binary
+
+    if target_name == "all" or (module_names is not None and len(module_names) != 1):
+        raise ConfigError("COFF scoring requires exactly one target and module")
+    modules, targets, _ = load_selection(config_path, target_name, module_names, function_name)
+    if len(targets) != 1 or len(modules) != 1:
+        raise ConfigError("COFF scoring requires exactly one target and module")
+    module = modules[0]
+    functions = [f for f in module.get("functions", []) if target_name in f]
+    labels = [f for f in module.get("code_labels", []) if target_name in f]
+    if len(functions) != 1 or labels:
+        raise ConfigError("COFF scoring requires exactly one native function")
+    validate_counted_code(modules, [target_name])
+    reference, _ = load_reference(targets[target_name], target_name)
+    coff = COFF(object_path)
+    function = functions[0]
+    validate_native_role(coff, function["symbol"], "function")
+    bindings = dict(module.get("bindings", {}).get(target_name, {}))
+    bindings[function["symbol"]] = dict(function[target_name])
+    try:
+        # Unreferenced configured definitions must pass the same data gate too.
+        for name, binding in bindings.items():
+            if "data_hex" in binding or "data_size" in binding:
+                validate_data_binding(coff, name, bindings, reference)
+        try:
+            _, rebuilt, original, _ = compare_function(
+                coff, function, target_name, bindings, reference)
+        except BodyExtentError:
+            _, original, rebuilt, _ = diagnostic_bytes(
+                coff, coff.function(function["symbol"]), function, target_name, bindings, reference)
+            return max(1, compare_binary(original, rebuilt).differing_positions)
+    except KeyError as error:
+        raise ValueError(f"Missing configured COFF symbol: {error.args[0]}") from error
+    return compare_binary(original, rebuilt).differing_positions
 
 
 def validate_counted_code(modules, versions):
@@ -316,15 +380,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     validate_counted_code(modules, versions)
     for version in versions:
         target_config = targets[version]
-        path = Path(target_value(target_config, "original_exe"))
-        expected_hash = target_value(target_config, "original_sha256")
-        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
-        if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
-            raise ValueError(f"Target {version} needs an original_sha256 digest")
-        if actual_hash != expected_hash.lower():
-            raise ValueError(f"Original SHA-256 mismatch for {version}: {path}")
+        reference, actual_hash = load_reference(target_config, version)
         reference_hashes[version] = actual_hash
-        reference = PE(path)
         for module in modules:
             entries = [(kind, f) for key, kind in (("functions", "function"), ("code_labels", "label"))
                        for f in module.get(key, []) if version in f]
