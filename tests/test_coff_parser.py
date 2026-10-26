@@ -43,6 +43,53 @@ def test_memory_and_path_parsing_preserve_the_same_native_symbol_indices(tmp_pat
     assert memory.function("_long_function_name")["data"] == b"\xc3" + b"\x90" * 15
 
 
+def test_cvtres_zero_length_empty_string_table_preserves_short_names(tmp_path):
+    canonical = COFF.from_bytes(object_bytes())
+    data = object_bytes()[:-4] + bytes(4)
+    path = tmp_path / "empty-strings.obj"
+    path.write_bytes(data)
+    for coff in (COFF.from_bytes(data), COFF(path)):
+        assert coff.sections == canonical.sections
+        assert coff.symbols == canonical.symbols
+        assert coff.named == canonical.named
+
+
+@pytest.mark.parametrize("missing", [1, 2, 3, 4])
+def test_empty_string_table_still_requires_its_complete_size_field(missing):
+    data = object_bytes()[:-4] + bytes(4)
+    with pytest.raises(ValueError, match="Truncated COFF string table"):
+        COFF.from_bytes(data[:-missing])
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 5, 0xFFFFFFFF])
+def test_invalid_nonzero_string_table_lengths_are_not_treated_as_empty(size):
+    data = object_bytes()[:-4] + struct.pack("<I", size)
+    with pytest.raises(ValueError, match="Truncated COFF string table"):
+        COFF.from_bytes(data)
+
+
+@pytest.mark.parametrize("offset", [0, 3, 4, 5, 0xFFFFFFFF])
+def test_zero_length_table_cannot_resolve_long_names_from_undeclared_bytes(offset):
+    data = bytearray(object_bytes("_long_function_name"))
+    symbol_table, count = struct.unpack_from("<II", data, 8)
+    struct.pack_into("<I", data, symbol_table + 4, offset)
+    struct.pack_into("<I", data, symbol_table + count * 18, 0)
+    with pytest.raises(ValueError, match="Bad COFF string offset"):
+        COFF.from_bytes(data)
+
+
+@pytest.mark.parametrize("offset, value, label", [
+    (8, 0x100000, "symbol table"),
+    (12, 0x100000, "symbol table"),
+    (40, 0x100000, "section or missing raw data"),
+])
+def test_zero_length_table_keeps_symbol_and_section_ranges_bounded(offset, value, label):
+    data = bytearray(object_bytes()[:-4] + bytes(4))
+    struct.pack_into("<I", data, offset, value)
+    with pytest.raises(ValueError, match=f"Truncated COFF {label}"):
+        COFF.from_bytes(data)
+
+
 @pytest.mark.parametrize("size", [0, 19, 59, 93, 97])
 def test_truncated_headers_sections_symbols_and_strings_raise_value_error(size):
     with pytest.raises(ValueError, match="Truncated COFF"):

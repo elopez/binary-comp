@@ -53,6 +53,9 @@ class COFF:
         strings = symbol_table + count * 18
         self._require_range(strings, 4, "string table")
         string_size = u32(self.data, strings)
+        # CVTRES writes zero for an empty table, but still emits its size field.
+        if string_size == 0:
+            string_size = 4
         if string_size < 4 or strings + string_size > len(self.data):
             raise ValueError("Truncated COFF string table")
 
