@@ -346,6 +346,104 @@ def test_alignment_instruction_is_never_silently_excluded_from_code(inline_switc
     assert not check(fixture)[0]
 
 
+def aligned_switch_tables(tmp_path, gap=b"\x8b\xff", tail=b"\x90" * 5):
+    # Two native pointer/index pairs. The first index payload's length, not
+    # its padding, determines how many byte indices are validated and counted.
+    indices = bytes(i % 2 for i in range(4 - len(gap)))
+    raw = b"\x31\xc0\xc3\x90" + bytes(8) + indices + gap + bytes(8) + b"\1\0\1" + tail
+    symbols = [{"name": "_dispatch", "section": 1, "type": 0x20},
+               {"name": "$zero", "section": 1, "value": 0, "storage": 6},
+               {"name": "$return", "section": 1, "value": 2, "storage": 6},
+               {"name": "$first", "section": 1, "value": 4, "storage": 6},
+               {"name": "$first_index", "section": 1, "value": 12, "storage": 6},
+               {"name": "$second", "section": 1, "value": 16, "storage": 6},
+               {"name": "$second_index", "section": 1, "value": 24, "storage": 6}]
+    relocations = [(4, 1, 6), (8, 2, 6), (16, 2, 6), (20, 1, 6)]
+    coff = COFF.from_bytes(coff_bytes([{"data": raw, "relocations": relocations}], symbols))
+    expected = bytearray(raw)
+    for offset, index, _ in relocations:
+        struct.pack_into("<I", expected, offset, TEXT_VA + symbols[index]["value"])
+    bindings = {s["name"]: {"va": hex(TEXT_VA + s.get("value", 0))} for s in symbols}
+    bindings["_dispatch"]["size"] = 4
+    for name in ("$first", "$second"):
+        bindings[name].update(inline_data=True, data_size=8)
+    bindings["$first_index"].update(inline_data=True, data_size=len(indices), inline_index_for="$first")
+    bindings["$second_index"].update(inline_data=True, data_size=3, inline_index_for="$second")
+    return coff, entry("_dispatch", TEXT_VA, 4), bindings, reference(tmp_path, expected)
+
+
+@pytest.mark.parametrize("gap", [b"", b"\x90", b"\x90\x90", b"\x8b\xff", b"\x8d\x49\0"])
+def test_complete_inline_pairs_allow_exact_native_four_byte_alignment(tmp_path, gap):
+    fixture = aligned_switch_tables(tmp_path, gap)
+    coff, _, bindings, image = fixture
+    assert check(fixture)[0]
+    window = code_window(coff, coff.function("_dispatch"), TEXT_VA, 4, bindings, image)
+    assert window["inline_data_bytes"] == 23 - len(gap)
+    assert window["inline_alignment_bytes"] == len(gap) + 5
+    assert len(window["data"]) == 4
+    assert validate_data_binding(coff, "$first_index", bindings, image)[0] == bytes(
+        i % 2 for i in range(4 - len(gap)))
+
+
+def test_final_inline_alignment_accepts_only_bounded_exact_short_instructions(tmp_path):
+    fixture = aligned_switch_tables(tmp_path, tail=b"\x8b\xff\x8d\x49\0")
+    assert check(fixture)[0]
+    coff, _, bindings, image = fixture
+    window = code_window(coff, coff.function("_dispatch"), TEXT_VA, 4, bindings, image)
+    assert window["inline_alignment_bytes"] == 7
+    assert window["excluded_nop_padding"] == 0
+
+
+@pytest.mark.parametrize("mutation", ["changed_gap", "unknown_gap", "changed_tail", "short_index",
+                                     "long_index", "padding_fixup", "crossing_fixup", "next_symbol",
+                                     "missing_pair", "excess_tail"])
+def test_inline_alignment_never_hides_changed_bytes_partial_tables_or_fixups(tmp_path, mutation):
+    coff, _, bindings, image = fixture = aligned_switch_tables(tmp_path)
+    section = coff.function("_dispatch")
+    raw = bytearray(section["data"])
+    if mutation == "changed_gap":
+        raw[14:16] = b"\x90\x90"  # Known padding still must equal the reference.
+    elif mutation == "unknown_gap":
+        raw[14:16] = b"\xeb\0"
+    elif mutation == "changed_tail":
+        raw[27:32] = b"\x8b\xff\x8d\x49\0"
+    elif mutation == "short_index":
+        bindings["$first_index"]["data_size"] = 1
+    elif mutation == "long_index":
+        bindings["$first_index"]["data_size"] = 3
+    elif mutation == "padding_fixup":
+        section["relocations"].append((14, 1, 6))
+    elif mutation == "crossing_fixup":
+        section["relocations"].append((11, 1, 6))
+    elif mutation == "next_symbol":
+        coff.named["$second"]["value"] = 17
+        bindings["$second"]["va"] = hex(TEXT_VA + 17)
+    elif mutation == "missing_pair":
+        del bindings["$second"]
+        del bindings["$second_index"]
+    elif mutation == "excess_tail":
+        raw += b"\x90" * 16
+    section["data"] = bytes(raw)
+    with pytest.raises(ValueError):
+        check(fixture)
+    if mutation in ("changed_gap", "unknown_gap", "short_index", "long_index", "padding_fixup",
+                    "crossing_fixup", "next_symbol"):
+        with pytest.raises(ValueError):
+            validate_data_binding(coff, "$first_index", bindings, image)
+
+
+def test_pre_table_lea_alignment_stays_in_the_complete_code_window(tmp_path):
+    coff, function, bindings, image = aligned_switch_tables(tmp_path)
+    section = coff.function("_dispatch")
+    section["data"] = b"\xc3\x8d\x49\0" + section["data"][4:]
+    expected = b"\xc3\x8d\x49\0" + image.read(TEXT_VA + 4, 28)
+    fixture = coff, function, bindings, reference(tmp_path, expected)
+    assert check(fixture)[0]
+    function["sample"]["size"] = 1
+    with pytest.raises(BodyExtentError, match="Non-NOP"):
+        check(fixture)
+
+
 def report_fixture(tmp_path, monkeypatch, coff, functions, bindings, image, code_labels=None):
     pytest.importorskip("capstone")
     from binary_comp.analyzers import coff_report
@@ -434,6 +532,27 @@ def test_report_decodes_code_only_and_counts_each_native_table_once(inline_switc
     assert diagnostic["comparison_window"] == "coff_code_before_inline_data"
     assert diagnostic["decoded_bytes"]["rebuilt"] == 32
     assert "0/1 relocated-byte equal" in (output / "report.txt").read_text()
+
+
+def test_report_keeps_inline_alignment_separate_and_rejects_changed_padding(tmp_path, monkeypatch):
+    coff, function, bindings, image = aligned_switch_tables(tmp_path)
+    failures, result, output, module, targets = report_fixture(
+        tmp_path, monkeypatch, coff, [function], bindings, image)
+    assert failures == 0
+    row, = result["code"]
+    assert row["relocated_bytes"]["exact"]
+    assert row["decoded_bytes"] == {"original": 4, "rebuilt": 4}
+    assert (row["inline_data_bytes"], row["inline_alignment_bytes"]) == (21, 7)
+    assert sum(item["size"] for item in result["data"]) == 21
+    section = coff.function("_dispatch")
+    section["data"] = section["data"][:14] + b"\x90\x90" + section["data"][16:]
+    from binary_comp.analyzers import coff_report
+
+    assert coff_report.report([module], targets, ["sample"], output) > 0
+    rejected = json.loads((output / "report.json").read_text())["code"][0]
+    assert "alignment differs" in rejected["error"]
+    assert "decoded_bytes" not in rejected
+    assert "relocated_bytes" not in rejected
 
 
 def test_invalid_inputs_remove_stale_reports_and_reviews(linked_function, tmp_path, monkeypatch):

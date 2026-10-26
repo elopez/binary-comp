@@ -256,6 +256,7 @@ def diagnostic_window(coff, section, function, version, bindings, reference):
                    coff_window_size=len(raw), checked_fixups=fixups)
     if inline:
         metrics.update(inline_data_bytes=window["inline_data_bytes"],
+                       inline_alignment_bytes=window["inline_alignment_bytes"],
                        inline_data_symbols=window["inline_data_symbols"])
     return metrics, note + "\n\n" + review
 
@@ -359,6 +360,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                                review=str(relative))
                     if "inline_data_bytes" in window:
                         row.update(inline_data_bytes=window["inline_data_bytes"],
+                                   inline_alignment_bytes=window["inline_alignment_bytes"],
                                    inline_data_symbols=window["inline_data_symbols"])
                 except (ValueError, KeyError) as exc:
                     row["error"] = str(exc)

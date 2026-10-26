@@ -24,6 +24,19 @@ def is_function_type(value):
     return (value & 0x30) == 0x20
 
 
+def _is_ia32_alignment(data):
+    """Recognize only short, side-effect-free compiler alignment instructions."""
+    offset = 0
+    while offset < len(data):
+        for instruction in (b"\x90", b"\x8b\xff", b"\x8d\x49\x00"):
+            if data.startswith(instruction, offset):
+                offset += len(instruction)
+                break
+        else:
+            return False
+    return True
+
+
 class COFF:
     """MSVC i386 object, retaining original symbol indices for relocations."""
 
@@ -168,13 +181,14 @@ class COFF:
         boundary = start + self.definition_extent(name)
         if not 0 < start < end <= boundary <= len(section["data"]):
             raise ValueError(f"Invalid inline table extent: {name}")
-        # A following native symbol bounds a table exactly. Only the final
-        # definition can have up to its next 16-byte boundary of NOP alignment.
+        # A following native symbol can bound four-byte table alignment. The
+        # final definition can extend only to its next 16-byte boundary.
         tail = section["data"][end:boundary]
-        if ((boundary != len(section["data"]) and tail)
-                or boundary > (end + 15) // 16 * 16
-                or any(byte != 0x90 for byte in tail)):
-            raise ValueError(f"Non-NOP or excessive trailing inline table padding: {name}")
+        if (boundary != len(section["data"]) and tail
+                and boundary != (end + 3) // 4 * 4):
+            raise ValueError(f"Excessive or unaligned inline table padding: {name}")
+        if boundary > (end + 15) // 16 * 16 or not _is_ia32_alignment(tail):
+            raise ValueError(f"Unknown or excessive inline table padding: {name}")
         if any(offset < 0 or offset + 4 > len(section["data"])
                for offset, _, _ in section["relocations"]):
             raise ValueError(f"Relocation outside inline table section: {name}")
@@ -203,7 +217,8 @@ class COFF:
             raise ValueError(f"Relocation in inline table padding: {name}")
         return {"symbol": symbol, "owner": functions[0], "section": section,
                 "start": start, "end": end, "data": section["data"][start:end],
-                "relocations": relocations, "trailing_nop_padding": len(tail)}
+                "relocations": relocations, "alignment_padding": tail,
+                "trailing_nop_padding": tail.count(b"\x90")}
 
     def function(self, name):
         symbol, section = self.definition(name)
@@ -315,6 +330,9 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
         origin = _binding_address(owner["va"], table["owner"]["name"])
         if address != origin + table["start"]:
             raise ValueError(f"Inline table address differs from native code offset: {name}")
+        padding = table["alignment_padding"]
+        if padding and reference.read(address + size, len(padding)) != padding:
+            raise ValueError(f"Inline table alignment differs from original: {name}")
         for _, index, _ in table["relocations"]:
             target = coff.resolve_symbol(index)
             target_binding = bindings.get(target["name"])
@@ -384,10 +402,10 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
     if tables:
         tables.sort(key=lambda item: item[1]["start"])
         for (_, previous), (_, following) in zip(tables, tables[1:]):
-            if previous["end"] != following["start"]:
+            if previous["end"] + len(previous["alignment_padding"]) != following["start"]:
                 raise ValueError("Inline data definitions must cover the complete native table suffix")
         last = tables[-1][1]
-        if last["end"] + last["trailing_nop_padding"] != len(raw):
+        if last["end"] + len(last["alignment_padding"]) != len(raw):
             raise ValueError("Unconfigured data follows native inline table")
         start = tables[0][1]["start"]
         if size > start:
@@ -411,7 +429,9 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
         return {"data": raw[:end], "relocations": relocations, "bindings": mapping,
                 "inline_data_bytes": sum(len(t["data"]) for _, t in tables),
                 "inline_data_symbols": [name for name, _ in tables],
-                "excluded_nop_padding": last["trailing_nop_padding"] + (0 if diagnostic else start - size)}
+                "inline_alignment_bytes": sum(len(t["alignment_padding"]) for _, t in tables),
+                "excluded_nop_padding": sum(t["trailing_nop_padding"] for _, t in tables)
+                                        + (0 if diagnostic else start - size)}
     if diagnostic:
         return {"data": raw, "relocations": section["relocations"], "bindings": bindings}
     # Only bounded NOP alignment outside the complete original body is excluded.

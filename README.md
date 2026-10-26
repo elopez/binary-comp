@@ -262,8 +262,13 @@ complete `data_size`; local case labels need their explicit original addresses.
 A following byte-index table also declares `inline_index_for` naming its pointer
 table. Native offsets, contiguous pointer fixups, index values, the complete
 table suffix and bounded alignment are validated. Tables are counted as data,
-excluded from instruction metrics. Known instruction alignment inside the
-configured code extent remains checked. Rejected extents may receive full
+excluded from instruction metrics. Between complete tables, alignment must end
+at a native symbol on the next four-byte boundary; final alignment is bounded
+by the next 16-byte boundary. Only NOP, MOV EDI,EDI and LEA ECX,[ECX] padding
+sequences are accepted, with no relocations and exact reference bytes. Reports
+record these bytes separately as `inline_alignment_bytes`. Known instruction
+alignment before the first table stays inside the configured code extent and
+is checked and decoded there. Rejected extents may receive full
 diagnostic reviews, but their failure remains visible and excluded from exact
 totals. These object comparisons do not establish whole-executable equality.
 
