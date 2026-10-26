@@ -15,7 +15,8 @@ import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, BodyExtentError, apply_fixups, code_window,
-                                   compare_function, is_function_type, validate_data_binding)
+                                   compare_function, is_function_type, validate_common_definitions,
+                                   validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
 
 PE = FileBackedPEImage
@@ -24,6 +25,35 @@ PE = FileBackedPEImage
 def load_object(module, target):
     """Load one caller-built object; compilation remains outside this backend."""
     return COFF(Path(target_value(target, "object_dir")) / (module["name"] + ".obj"))
+
+
+def _common_definition_records(module):
+    records = module.get("common_definitions", {})
+    if not isinstance(records, dict):
+        raise ConfigError("common_definitions must map target names to provider objects")
+    for version, names in records.items():
+        _component(version, "COMMON provider target")
+        if not isinstance(names, dict):
+            raise ConfigError("COMMON provider targets must map symbols to object basenames")
+        for name, filename in names.items():
+            if not isinstance(name, str) or not name:
+                raise ConfigError("COMMON provider needs a nonempty native symbol")
+            _component(filename, "COMMON provider object")
+            if not filename.lower().endswith(".obj") or ":" in filename:
+                raise ConfigError("COMMON provider object must be an .obj basename")
+    return records
+
+
+def load_common_definitions(module, target, version):
+    """Load only explicit providers from the configured object directory."""
+    names = _common_definition_records(module).get(version, {})
+    objects = {}
+    for filename in names.values():
+        if filename not in objects:
+            objects[filename] = COFF(Path(target_value(target, "object_dir")) / filename)
+    return {name: objects[filename] for name, filename in names.items()}, {
+        f"{version}/{filename}": hashlib.sha256(coff.data).hexdigest()
+        for filename, coff in objects.items()}
 
 
 def target_value(target, name):
@@ -117,6 +147,9 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
         seen.add(name)
         if "source" in module and not isinstance(module["source"], str):
             raise ConfigError(f"{name}.source must be a path label")
+        providers = _common_definition_records(module)
+        if providers.keys() - target_configs.keys():
+            raise ConfigError(f"Unknown COMMON provider target in {name}")
         for key in ("functions", "code_labels"):
             entries = module.get(key, [])
             if not isinstance(entries, list):
@@ -256,28 +289,33 @@ def compare_windows(label, address, original, raw, relocated):
     return result, "\n\n".join(review) + "\n"
 
 
-def diagnostic_bytes(coff, section, function, version, bindings, reference):
+def diagnostic_bytes(coff, section, function, version, bindings, reference, *,
+                     common_definitions=None):
     """Relocate a rejected complete code window without disassembly or report output."""
     target = function[version]
     address, size = int(target["va"], 16), target["size"]
     original = reference.read(address, size)
-    window = code_window(coff, section, address, size, bindings, reference, diagnostic=True)
+    window = code_window(coff, section, address, size, bindings, reference, diagnostic=True,
+                         common_definitions=common_definitions)
     bindings = window["bindings"]
     # Validate even unreferenced configured data before publishing diagnostics.
     # A length failure in the strict gate occurs before its relocation checks.
     for name, binding in bindings.items():
         if "data_hex" in binding or "data_size" in binding:
-            validate_data_binding(coff, name, bindings, reference)
+            validate_data_binding(coff, name, bindings, reference,
+                                  common_definitions=common_definitions)
     raw = window["data"]
     rebuilt, fixups = apply_fixups(coff, raw, window["relocations"], address,
-                                  bindings, reference)
+                                  bindings, reference, common_definitions=common_definitions)
     return window, original, rebuilt, fixups
 
 
-def diagnostic_window(coff, section, function, version, bindings, reference):
+def diagnostic_window(coff, section, function, version, bindings, reference, *,
+                      common_definitions=None):
     """Review a rejected code extent, keeping explicitly validated native data separate."""
     window, original, rebuilt, fixups = diagnostic_bytes(
-        coff, section, function, version, bindings, reference)
+        coff, section, function, version, bindings, reference,
+        common_definitions=common_definitions)
     address, size = int(function[version]["va"], 16), function[version]["size"]
     raw = window["data"]
     metrics, review = compare_windows(function["label"], address, original, raw, rebuilt)
@@ -319,21 +357,26 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     validate_counted_code(modules, [target_name])
     reference, _ = load_reference(targets[target_name], target_name)
     coff = COFF(object_path)
+    common_definitions, _ = load_common_definitions(module, targets[target_name], target_name)
     function = functions[0]
     validate_native_role(coff, function["symbol"], "function")
     bindings = _code_bindings(module.get("bindings", {}).get(target_name, {}),
                               functions, target_name)
+    validate_common_definitions(coff, bindings, reference, common_definitions)
     try:
         # Unreferenced configured definitions must pass the same data gate too.
         for name, binding in bindings.items():
             if "data_hex" in binding or "data_size" in binding:
-                validate_data_binding(coff, name, bindings, reference)
+                validate_data_binding(coff, name, bindings, reference,
+                                      common_definitions=common_definitions)
         try:
             _, rebuilt, original, _ = compare_function(
-                coff, function, target_name, bindings, reference)
+                coff, function, target_name, bindings, reference,
+                common_definitions=common_definitions)
         except BodyExtentError:
             _, original, rebuilt, _ = diagnostic_bytes(
-                coff, coff.function(function["symbol"]), function, target_name, bindings, reference)
+                coff, coff.function(function["symbol"]), function, target_name, bindings, reference,
+                common_definitions=common_definitions)
             return max(1, compare_binary(original, rebuilt).differing_positions)
     except KeyError as error:
         raise ValueError(f"Missing configured COFF symbol: {error.args[0]}") from error
@@ -387,6 +430,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     rows, data_rows = [], []
     output = Path(output)
     object_hashes = {}
+    provider_hashes = {}
     reference_hashes = {}
     output.mkdir(parents=True, exist_ok=True)
     # A failed compilation/reference check must not leave an old green summary.
@@ -400,14 +444,18 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         for module in modules:
             entries = [(kind, f) for key, kind in (("functions", "function"), ("code_labels", "label"))
                        for f in module.get(key, []) if version in f]
-            if not entries and not module.get("bindings", {}).get(version):
+            if (not entries and not module.get("bindings", {}).get(version)
+                    and not _common_definition_records(module).get(version)):
                 continue
             coff = load_object(module, target_config)
+            common_definitions, hashes = load_common_definitions(module, target_config, version)
+            provider_hashes.update(hashes)
             for kind, function in entries:
                 validate_native_role(coff, function["symbol"], kind)
             object_hashes[f"{version}/{module['name']}"] = hashlib.sha256(coff.data).hexdigest()
             bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
                                       [f for _, f in entries], version)
+            validate_common_definitions(coff, bindings, reference, common_definitions)
             for kind, function in entries:
                 target = function[version]
                 row = {"version": version, "module": module["name"], "kind": kind,
@@ -420,9 +468,11 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 try:
                     section = coff.function(function["symbol"])
                     _, rebuilt, original, fixups = compare_function(
-                        coff, function, version, bindings, reference)
+                        coff, function, version, bindings, reference,
+                        common_definitions=common_definitions)
                     window = code_window(coff, section, int(target["va"], 16), len(original),
-                                         bindings, reference)
+                                         bindings, reference,
+                                         common_definitions=common_definitions)
                     metrics, review = compare_windows(function["label"], int(target["va"], 16),
                                                       original, window["data"], rebuilt)
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -440,7 +490,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                             and isinstance(exc, BodyExtentError)):
                         try:
                             metrics, review = diagnostic_window(
-                                coff, section, function, version, bindings, reference)
+                                coff, section, function, version, bindings, reference,
+                                common_definitions=common_definitions)
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             destination.write_text("Strict matcher error: " + str(exc) + "\n\n" + review)
                             row.update(metrics, review=str(relative))
@@ -452,10 +503,17 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                     continue
                 row = {"version": version, "module": module["name"], "symbol": name}
                 try:
-                    actual, fixups = validate_data_binding(coff, name, bindings, reference)
+                    actual, fixups = validate_data_binding(coff, name, bindings, reference,
+                                                          common_definitions=common_definitions)
                     row.update(exact=True, size=len(actual), checked_fixups=fixups)
                     if coff.common_size(name) is not None:
                         row.update(storage="common", object_file_bytes=0)
+                        if name in common_definitions:
+                            _, provider_section = common_definitions[name].definition(name)
+                            row.update(storage="common_overridden",
+                                       provider_object=module["common_definitions"][version][name],
+                                       provider_file_bytes=(0 if provider_section["flags"] & 0x80
+                                                            else len(actual)))
                 except (ValueError, KeyError) as exc:
                     row.update(exact=False, error=str(exc))
                 data_rows.append(row)
@@ -470,7 +528,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "relocated_bytes": "All original bytes vs body after explicit checked COFF fixups; no masks",
             "diagnostic_only": "Rejected extents compare the COFF section, or its code prefix before validated inline data, including padding; the strict gate error remains a failure",
             "mnemonic_similarity": "binary-comp normalized linear mnemonic Levenshtein score; ignores all operands",
-            "data": "Complete configured COFF definitions, including native inline tables and sectionless zero-initialized COMMON contributions, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
+            "data": "Complete configured COFF definitions, including native inline tables and sectionless COMMON contributions with logical zeros or explicitly selected strong providers, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
         "inputs": {
@@ -479,6 +537,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "sources_sha256": source_hashes(modules, source_root),
             "analysis_sha256": reference_hashes,
             "objects_sha256": object_hashes,
+            "provider_objects_sha256": provider_hashes,
         },
         "code": rows, "data": data_rows,
     }

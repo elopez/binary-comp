@@ -265,6 +265,27 @@ is capped at 16 MiB; larger requested sizes remain available as metadata.
 This checks one object's COMMON request, not the largest coalesced allocation,
 final section layout, unique address identification, or linker ownership.
 
+An explicit strong definition in another object can replace a COMMON's logical
+zeros. A module selects providers by target and native symbol, for example
+`"common_definitions": {"retail": {"_number": "State.obj"}}`. Each basename
+resolves from the target's configured `object_dir`, including when scoring an
+external `--object` candidate. The consumer must retain a recognized COMMON;
+the provider must contain the same-name external, section-backed data definition.
+Its complete native extent and the complete data binding must both equal the
+COMMON request. All provider bytes and relocations are checked, even for an
+unreferenced mapping. Mappings without a recognized consumer COMMON are rejected.
+
+The core comparison APIs accept keyword-only `common_definitions` as a mapping
+from names to already parsed `COFF` providers; the core performs no file lookup.
+Provider fixups use the consumer's explicit binding map. There is no automatic
+provider search or separate provider dependency context: provider-owned data
+dependencies need complete bindings and may need a separate ordinary module
+comparison; missing dependencies fail closed. Reports identify overridden
+contributions as `common_overridden`, retain the consumer's zero file-byte count,
+record provider file bytes, and hash provider objects separately. Selecting a
+provider adds no extra counted data row and does not establish final linker
+allocation or whole-link ownership.
+
 Identical source aliases can remain address bindings while a single canonical
 body is listed in `functions`. Multiple typed function symbols in one code
 section are accepted only when all start at offset zero; either name selects

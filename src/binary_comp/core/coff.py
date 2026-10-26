@@ -6,6 +6,7 @@ object with ``read(va, size)``; they never normalize arbitrary operands. No
 compiler, linker, project layout or build command is assumed here.
 """
 from pathlib import Path
+from collections.abc import Mapping
 import struct
 
 from .binary import compare_binary
@@ -324,8 +325,11 @@ def _validate_function_alias_bindings(coff, section, origin, bindings):
             raise ValueError(f"Co-located function alias address differs from origin: {name}")
 
 
-def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None):
+def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None,
+                 *, common_definitions=None):
     _checked_origin(origin)
+    if visiting is None:
+        validate_common_definitions(coff, bindings, reference, common_definitions)
     body = bytearray(raw)
     occupied = set()
     for offset, index, kind in relocations:
@@ -344,7 +348,8 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
             _validate_function_alias_bindings(
                 coff, coff.sections[symbol["section"] - 1], address, bindings)
         if "data_hex" in binding or "data_size" in binding:
-            validate_data_binding(coff, name, bindings, reference, visiting)
+            validate_data_binding(coff, name, bindings, reference, visiting,
+                                  common_definitions=common_definitions)
         elif (_is_common_symbol(symbol) or (symbol["section"] != 0 and
               not coff.sections[symbol["section"] - 1]["flags"] & 0x20)):
             raise ValueError(f"Defined data symbol needs complete data validation: {name}")
@@ -359,10 +364,52 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
     return bytes(body), len(relocations)
 
 
-def validate_data_binding(coff, name, bindings, reference, visiting=None):
+def validate_common_definitions(coff, bindings, reference, common_definitions=None):
+    """Eagerly validate explicit same-size strong providers for native COMMONs.
+
+    Providers are already parsed objects. No file lookup, symbol search or
+    section synthesis takes place in the core. All use the caller's bindings.
+    """
+    if common_definitions is None:
+        return
+    if not isinstance(common_definitions, Mapping):
+        raise ValueError("COMMON definitions must map names to COFF providers")
+    for name, provider in common_definitions.items():
+        if not isinstance(name, str) or not name or not isinstance(provider, COFF):
+            raise ValueError("Invalid COMMON provider record")
+        common = coff.common_size(name) if name in coff.named else None
+        if common is None:
+            raise ValueError(f"COMMON provider needs a recognized consumer COMMON: {name}")
+        if (not isinstance(bindings.get(name), Mapping)
+                or not ({"data_size", "data_hex"} & bindings[name].keys())):
+            raise ValueError(f"COMMON provider needs complete data validation: {name}")
+        try:
+            symbol, section = provider.definition(name)
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"COMMON provider needs a same-name strong data definition: {name}") from error
+        if (symbol["storage"] != 2 or symbol["aux_count"] != 0
+                or is_function_type(symbol["type"])
+                or ((symbol["type"] & 0xF) == 1 and (symbol["type"] & 0x30) != 0x10)
+                or section["flags"] & 0x20 or not section["flags"] & 0xC0
+                or "weak_fallback" in symbol):
+            raise ValueError(f"COMMON provider needs a same-name strong data definition: {name}")
+        if provider.definition_extent(name) != common:
+            raise ValueError(f"COMMON provider extent differs from requested size: {name}")
+    # A configured but unreferenced mapping must not hide wrong provider bytes,
+    # missing dependencies, a bare address or an invalid contribution extent.
+    for name in common_definitions:
+        validate_data_binding(coff, name, bindings, reference, set(),
+                              common_definitions=common_definitions)
+
+
+def validate_data_binding(coff, name, bindings, reference, visiting=None,
+                          *, common_definitions=None):
     """Compare a complete data definition, including all checked pointer fixups."""
-    visiting = set() if visiting is None else visiting
-    if name in visiting:
+    if visiting is None:
+        validate_common_definitions(coff, bindings, reference, common_definitions)
+        visiting = set()
+    identity = id(coff), name
+    if identity in visiting:
         raise ValueError(f"Cyclic data binding: {name}")
     binding = bindings[name]
     address = _binding_address(binding["va"], name)
@@ -384,6 +431,14 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
         if size != common:
             raise ValueError(f"Configured data extent differs from COMMON contribution: {name}")
         _validate_common_range(name, bindings, address, size)
+        if common_definitions is not None and name in common_definitions:
+            visiting.add(identity)
+            try:
+                return validate_data_binding(common_definitions[name], name, bindings,
+                                             reference, visiting,
+                                             common_definitions=common_definitions)
+            finally:
+                visiting.remove(identity)
     if "data_hex" in binding:
         if not expected or reference.read(address, size) != expected:
             raise ValueError(f"Original constant differs for {name}")
@@ -418,7 +473,8 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
                     or _binding_address(target_binding["va"], target["name"]) != origin + target["value"]):
                 raise ValueError(f"Inline case target differs from native code offset: {target['name']}")
         if "inline_index_for" in binding:
-            validate_data_binding(coff, binding["inline_index_for"], bindings, reference, visiting | {name})
+            validate_data_binding(coff, binding["inline_index_for"], bindings, reference,
+                                  visiting | {identity}, common_definitions=common_definitions)
     elif is_function_type(definition["type"]) or section["flags"] & 0x20:
         raise ValueError(f"Expected a data definition for {name}")
     if not inline and coff.definition_extent(name) != size:
@@ -433,11 +489,12 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
     relocations = [(offset - start, index, kind)
                    for offset, index, kind in section["relocations"]
                    if offset < end and offset + 4 > start]
-    visiting.add(name)
+    visiting.add(identity)
     try:
-        actual, fixups = apply_fixups(coff, raw, relocations, address, bindings, reference, visiting)
+        actual, fixups = apply_fixups(coff, raw, relocations, address, bindings, reference,
+                                     visiting, common_definitions=common_definitions)
     finally:
-        visiting.remove(name)
+        visiting.remove(identity)
     if not compare_binary(expected, actual).exact:
         raise ValueError(f"Rebuilt data differs from original: {name}")
     return actual, fixups
@@ -482,9 +539,11 @@ def inline_table(coff, name, bindings):
     return table
 
 
-def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=False):
+def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=False,
+                common_definitions=None):
     """Bound code and native inline data once for both the gate and reviews."""
     _checked_origin(origin)
+    validate_common_definitions(coff, bindings, reference, common_definitions)
     _validate_function_alias_bindings(coff, section, origin, bindings)
     raw = section["data"]
     tables = []
@@ -517,7 +576,8 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
                     or reference.read(origin + size, len(gap)) != gap):
                 raise BodyExtentError("Non-NOP or changed alignment before inline table")
         for name, _ in tables:
-            validate_data_binding(coff, name, mapping, reference)
+            validate_data_binding(coff, name, mapping, reference,
+                                  common_definitions=common_definitions)
         end = start if diagnostic else size
         relocations = [(offset, index, kind) for offset, index, kind in section["relocations"]
                        if offset < start]
@@ -540,16 +600,19 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
             "excluded_nop_padding": len(raw) - size}
 
 
-def relocate(coff, section, origin, size, bindings, reference):
-    window = code_window(coff, section, origin, size, bindings, reference)
+def relocate(coff, section, origin, size, bindings, reference, *, common_definitions=None):
+    window = code_window(coff, section, origin, size, bindings, reference,
+                         common_definitions=common_definitions)
     return apply_fixups(coff, window["data"], window["relocations"], origin,
-                        window["bindings"], reference)
+                        window["bindings"], reference, common_definitions=common_definitions)
 
 
-def compare_function(coff, function, version, bindings, reference):
+def compare_function(coff, function, version, bindings, reference, *, common_definitions=None):
+    validate_common_definitions(coff, bindings, reference, common_definitions)
     target = function[version]
     address, size = _binding_address(target["va"], function["symbol"]), target["size"]
     section = coff.function(function["symbol"])
-    actual, relocations = relocate(coff, section, address, size, bindings, reference)
+    actual, relocations = relocate(coff, section, address, size, bindings, reference,
+                                   common_definitions=common_definitions)
     expected = reference.read(address, size)
     return compare_binary(expected, actual).exact, actual, expected, relocations
