@@ -124,7 +124,8 @@ class COFF:
                 if symbol["weak_search"] not in (1, 2, 3):
                     raise ValueError(f"Unsupported weak external search mode for {name}")
             self.symbols[i] = symbol
-            if storage in (2, 105) or (storage in (3, 6) and aux == 0 and section > 0):
+            if (storage in (2, 105) or (storage in (3, 6) and section > 0
+                    and (aux == 0 or is_function_type(kind)))):
                 previous = self.named.get(name)
                 if previous and previous["section"] > 0 and section > 0:
                     raise ValueError(f"Ambiguous symbol definitions for {name}")
@@ -165,6 +166,12 @@ class COFF:
             raise ValueError(f"Undefined symbol {name}")
         return symbol, self.sections[symbol["section"] - 1]
 
+    def _section_functions(self, section):
+        return [s for s in self.symbols.values()
+                if 1 <= s["section"] <= len(self.sections)
+                and self.sections[s["section"] - 1] is section
+                and is_function_type(s["type"])]
+
     def inline_table(self, name, size, *, index_entries=None):
         """Bound native local case pointers or byte indices in a /Gy code section."""
         symbol, section = self.definition(name)
@@ -173,8 +180,7 @@ class COFF:
             raise ValueError(f"Expected an inline code-section data label: {name}")
         if type(size) is not int or size <= 0:
             raise ValueError(f"Invalid inline table size: {name}")
-        functions = [s for s in self.named.values()
-                     if s["section"] == symbol["section"] and is_function_type(s["type"])]
+        functions = self._section_functions(section)
         if len(functions) != 1 or functions[0]["value"] != 0:
             raise ValueError("Inline data requires one /Gy function per section")
         start, end = symbol["value"], symbol["value"] + size
@@ -225,10 +231,9 @@ class COFF:
         if not section["flags"] & 0x20:
             raise ValueError(f"Not a code symbol: {name}")
         if is_function_type(symbol["type"]):
-            functions = [s for s in self.named.values()
-                         if s["section"] == symbol["section"] and is_function_type(s["type"])]
-            if symbol["value"] != 0 or len(functions) != 1:
-                raise ValueError("Comparison requires one /Gy function per section")
+            functions = self._section_functions(section)
+            if any(s["value"] != 0 for s in functions):
+                raise ValueError("Comparison requires all /Gy function entries at section offset zero")
             return section
         # VC6 emits EH cleanup/handler entries as labels in a shared .text$x
         # section. Bound each complete entry by the next symbol or section end.
@@ -267,6 +272,19 @@ def _binding_address(value, name):
     return address
 
 
+def _validate_function_alias_bindings(coff, section, origin, bindings):
+    """Co-located entry names cannot acquire different configured origins."""
+    functions = coff._section_functions(section)
+    if len(functions) <= 1:
+        return
+    if any(s["value"] != 0 for s in functions):
+        raise ValueError("Comparison requires all /Gy function entries at section offset zero")
+    for symbol in functions:
+        name = symbol["name"]
+        if name in bindings and _binding_address(bindings[name]["va"], name) != origin:
+            raise ValueError(f"Co-located function alias address differs from origin: {name}")
+
+
 def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None):
     _checked_origin(origin)
     body = bytearray(raw)
@@ -283,6 +301,9 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
         address = _binding_address(binding["va"], name)
         if symbol["section"] != 0 and not 1 <= symbol["section"] <= len(coff.sections):
             raise ValueError(f"Unsupported relocation symbol section: {name}")
+        if symbol["section"] > 0 and is_function_type(symbol["type"]):
+            _validate_function_alias_bindings(
+                coff, coff.sections[symbol["section"] - 1], address, bindings)
         if "data_hex" in binding or "data_size" in binding:
             validate_data_binding(coff, name, bindings, reference, visiting)
         elif (symbol["section"] != 0 and
@@ -389,6 +410,7 @@ def inline_table(coff, name, bindings):
 def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=False):
     """Bound code and native inline data once for both the gate and reviews."""
     _checked_origin(origin)
+    _validate_function_alias_bindings(coff, section, origin, bindings)
     raw = section["data"]
     tables = []
     for name, binding in bindings.items():

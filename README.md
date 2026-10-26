@@ -251,7 +251,13 @@ definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
 weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
 Identical source aliases can remain address bindings while a single canonical
-body is listed in `functions`. Each object can count a symbol only once; local
+body is listed in `functions`. Multiple typed function symbols in one code
+section are accepted only when all start at offset zero; either name selects
+the same complete body. Every explicitly bound co-located alias must use the
+compared body's origin, including aliases referenced by code or data fixups.
+A counted entry's explicit address binding must also agree with its configured
+code address. Multiple distinct entry offsets and nonzero entry aliases fail.
+Each object can count a symbol only once; local
 symbol names may repeat in other objects. Original code windows must be unique
 and nonoverlapping across modules and roles for each target. Native
 function symbols belong in `functions`; native compiler code labels belong in
@@ -259,6 +265,8 @@ function symbols belong in `functions`; native compiler code labels belong in
 
 Native pointer tables in a code section require `inline_data: true` and a
 complete `data_size`; local case labels need their explicit original addresses.
+Code sections with inline tables still require exactly one typed function
+symbol; table ownership is not inferred from co-located aliases.
 A following byte-index table also declares `inline_index_for` naming its pointer
 table. Native offsets, contiguous pointer fixups, index values, the complete
 table suffix and bounded alignment are validated. Tables are counted as data,

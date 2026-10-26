@@ -64,6 +64,19 @@ def _component(value, label):
     return value
 
 
+def _code_bindings(bindings, entries, version):
+    """Add counted code addresses without hiding an explicit contradiction."""
+    result = dict(bindings)
+    for entry in entries:
+        if version not in entry:
+            continue
+        explicit = result.get(entry["symbol"])
+        if explicit is not None and int(explicit["va"], 16) != int(entry[version]["va"], 16):
+            raise ConfigError(f"Conflicting configured code address for {entry['symbol']}")
+        result[entry["symbol"]] = dict(entry[version])
+    return result
+
+
 def load_selection(config_path, target_name, module_names=None, function_name=None):
     """Load explicit modules and arbitrary target names without source parsing."""
     config_path = Path(config_path).resolve()
@@ -134,6 +147,9 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 if "data_size" in binding and (type(binding["data_size"]) is not int
                                                 or binding["data_size"] <= 0):
                     raise ConfigError(f"Invalid COFF data_size for {symbol}")
+            _code_bindings(bindings.get(target_name, {}),
+                           [entry for key in ("functions", "code_labels")
+                            for entry in module.get(key, [])], target_name)
     if module_names:
         if set(module_names) - seen:
             raise ConfigError("Unknown COFF module: " + ", ".join(sorted(set(module_names) - seen)))
@@ -149,12 +165,11 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 continue
             narrowed = dict(module)
             # All function addresses remain available to code and data fixups.
-            narrowed["bindings"] = {name: dict(module.get("bindings", {}).get(name, {}))
-                                    for name in targets}
-            for name in targets:
-                for key in ("functions", "code_labels"):
-                    narrowed["bindings"][name].update({f["symbol"]: dict(f[name])
-                        for f in module.get(key, []) if name in f})
+            narrowed["bindings"] = {
+                name: _code_bindings(module.get("bindings", {}).get(name, {}),
+                                     [f for key in ("functions", "code_labels")
+                                      for f in module.get(key, [])], name)
+                for name in targets}
             for key in ("functions", "code_labels"):
                 narrowed[key] = [f for role, f in entries if role == key]
             selected.append(narrowed)
@@ -306,8 +321,8 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     coff = COFF(object_path)
     function = functions[0]
     validate_native_role(coff, function["symbol"], "function")
-    bindings = dict(module.get("bindings", {}).get(target_name, {}))
-    bindings[function["symbol"]] = dict(function[target_name])
+    bindings = _code_bindings(module.get("bindings", {}).get(target_name, {}),
+                              functions, target_name)
     try:
         # Unreferenced configured definitions must pass the same data gate too.
         for name, binding in bindings.items():
@@ -391,8 +406,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             for kind, function in entries:
                 validate_native_role(coff, function["symbol"], kind)
             object_hashes[f"{version}/{module['name']}"] = hashlib.sha256(coff.data).hexdigest()
-            bindings = dict(module.get("bindings", {}).get(version, {}))
-            bindings.update({f["symbol"]: dict(f[version]) for _, f in entries})
+            bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
+                                      [f for _, f in entries], version)
             for kind, function in entries:
                 target = function[version]
                 row = {"version": version, "module": module["name"], "kind": kind,
