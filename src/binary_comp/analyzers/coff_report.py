@@ -24,7 +24,39 @@ PE = FileBackedPEImage
 
 def load_object(module, target):
     """Load one caller-built object; compilation remains outside this backend."""
-    return COFF(Path(target_value(target, "object_dir")) / (module["name"] + ".obj"))
+    return COFF(object_path(target, module["name"] + ".obj"))
+
+
+def object_directories(target):
+    """Accept parsed targets and direct API dictionaries without root precedence."""
+    if isinstance(target, dict):
+        if "object_dir" in target and "object_dirs" in target:
+            raise ConfigError("object_dir and object_dirs are mutually exclusive")
+        if "object_dirs" in target:
+            directories = target["object_dirs"]
+            if (not isinstance(directories, list) or not directories
+                    or any(not isinstance(path, str) or not path for path in directories)):
+                raise ConfigError("object_dirs must be a nonempty list of directory strings")
+            return tuple(Path(path) for path in directories)
+    elif getattr(target, "object_dirs", ()):
+        if target.object_dir is not None:
+            raise ConfigError("object_dir and object_dirs are mutually exclusive")
+        return tuple(Path(path) for path in target.object_dirs)
+    return (Path(target_value(target, "object_dir")),)
+
+
+def object_path(target, filename):
+    """Require exactly one basename match, including explicit COMMON providers."""
+    directories = object_directories(target)
+    matches = [directory / filename for directory in directories
+               if (directory / filename).is_file()]
+    if not matches:
+        raise FileNotFoundError(f"COFF object not found: {filename}; searched "
+                                + ", ".join(str(path) for path in directories))
+    if len(matches) != 1:
+        raise ConfigError(f"Ambiguous COFF object: {filename}; matches "
+                          + ", ".join(str(path) for path in matches))
+    return matches[0]
 
 
 def _common_definition_records(module):
@@ -45,12 +77,12 @@ def _common_definition_records(module):
 
 
 def load_common_definitions(module, target, version):
-    """Load only explicit providers from the configured object directory."""
+    """Load only explicit providers from the configured object directories."""
     names = _common_definition_records(module).get(version, {})
     objects = {}
     for filename in names.values():
         if filename not in objects:
-            objects[filename] = COFF(Path(target_value(target, "object_dir")) / filename)
+            objects[filename] = COFF(object_path(target, filename))
     return {name: objects[filename] for name, filename in names.items()}, {
         f"{version}/{filename}": hashlib.sha256(coff.data).hexdigest()
         for filename, coff in objects.items()}
@@ -85,6 +117,21 @@ def source_hashes(modules, source_root):
         if source and (Path(source_root) / source).is_file():
             result[source] = hashlib.sha256((Path(source_root) / source).read_bytes()).hexdigest()
     return result
+
+
+def manifest_hashes(manifest_path, modules):
+    """Keep the single-file digest and retain every composed manifest input."""
+    if manifest_path is None:
+        return {"modules_sha256": hashlib.sha256(
+            json.dumps(modules, sort_keys=True).encode()).hexdigest()}
+    paths = ((Path(manifest_path),) if isinstance(manifest_path, (str, Path))
+             else tuple(Path(path) for path in manifest_path))
+    digests = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    if len(paths) == 1:
+        return {"modules_sha256": digests[str(paths[0])]}
+    return {"modules_sha256": hashlib.sha256(
+                json.dumps([digests[str(path)] for path in paths]).encode()).hexdigest(),
+            "module_manifests_sha256": digests}
 
 
 def _component(value, label):
@@ -125,18 +172,25 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
         _, target = load_project_target(config_path, name)
         if target.kind != "i386-coff":
             raise ConfigError(f"Target {name} is not i386-coff")
-        target_value(target, "object_dir")
+        object_directories(target)
         digest = target_value(target, "original_sha256")
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
             raise ConfigError(f"Target {name} needs an original_sha256 digest")
         targets[name] = target
     section = config.get("coff")
-    if not isinstance(section, dict) or not isinstance(section.get("modules"), str):
-        raise ConfigError("coff.modules must name a module manifest")
-    manifest = config_path.parent / section["modules"]
-    modules = json.loads(manifest.read_text())
-    if not isinstance(modules, list):
-        raise ConfigError("COFF module manifest must be a list")
+    manifests = section.get("modules") if isinstance(section, dict) else None
+    if isinstance(manifests, str) and manifests:
+        manifests = [manifests]
+    if (not isinstance(manifests, list) or not manifests
+            or any(not isinstance(path, str) or not path for path in manifests)):
+        raise ConfigError("coff.modules must name a manifest or a nonempty list of manifests")
+    paths = tuple(config_path.parent / path for path in manifests)
+    modules = []
+    for path in paths:
+        entries = json.loads(path.read_text())
+        if not isinstance(entries, list):
+            raise ConfigError(f"COFF module manifest must be a list: {path}")
+        modules.extend(entries)
     seen = set()
     for module in modules:
         if not isinstance(module, dict):
@@ -209,7 +263,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
         modules = selected
         if not modules:
             raise ConfigError(f"COFF function not found: {function_name}")
-    return modules, targets, manifest
+    return modules, targets, paths[0] if len(paths) == 1 else paths
 
 
 def run_config(config_path, target_name, output, *, module_names=None,
@@ -458,6 +512,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     # A failed compilation/reference check must not leave an old green summary.
     for filename in ("report.json", "report.txt"):
         (output / filename).unlink(missing_ok=True)
+    module_inputs = manifest_hashes(manifest_path, modules)
     validate_counted_code(modules, versions)
     for version in versions:
         external_bindings = {}
@@ -561,8 +616,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
         "inputs": {
-            "modules_sha256": hashlib.sha256(Path(manifest_path).read_bytes() if manifest_path
-                                              else json.dumps(modules, sort_keys=True).encode()).hexdigest(),
+            **module_inputs,
             "sources_sha256": source_hashes(modules, source_root),
             "analysis_sha256": reference_hashes,
             "objects_sha256": object_hashes,

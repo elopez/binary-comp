@@ -231,6 +231,40 @@ configuration, including `source_root`, are relative to that directory. Original
 images and actual object bytes are always hashed. Build commands may be supplied
 through the existing target `build` settings; `--no-build` reads existing objects.
 
+To compare independently maintained module sets together, `coff.modules` also
+accepts a nonempty list of manifest paths. Module names must be unique across
+all files. Each target may replace `object_dir` with a nonempty `object_dirs`
+list; the two fields are mutually exclusive. For example:
+
+```json
+{
+  "coff": {"modules": ["config/core.json", "config/support.json"]},
+  "targets": {
+    "retail": {
+      "kind": "i386-coff",
+      "original_exe": "original.exe",
+      "original_sha256": "<64 hexadecimal SHA-256 characters>",
+      "object_dirs": ["build/core", "build/support"]
+    }
+  }
+}
+```
+
+Manifest and object-directory paths are relative to the configuration directory.
+Each selected `<module name>.obj` must occur in exactly one configured root;
+multiple matches fail even when their bytes are identical. There is no root
+precedence. The selected union uses the same strict code/data gates and external
+address consistency checks as a single manifest. Module, function and file
+filters limit the checked objects; they do not assert consistency for objects
+outside that selection.
+
+Reports keep the raw manifest file SHA-256 in `inputs.modules_sha256` for a
+single manifest, including a one-item list. With multiple manifests,
+`inputs.module_manifests_sha256` records every manifest path and file digest,
+and `inputs.modules_sha256` hashes the JSON-encoded list of those digests in
+configuration order. All configured manifest inputs remain in provenance when
+the object selection is filtered. Object and provider bytes are hashed as usual.
+
 ```sh
 binary-comp report --config binary-comp.json --target all --no-build --output build/report
 binary-comp report --config binary-comp.json --target retail --module Sample --no-build
@@ -268,8 +302,8 @@ final section layout, unique address identification, or linker ownership.
 An explicit strong definition in another object can replace a COMMON's logical
 zeros. A module selects providers by target and native symbol, for example
 `"common_definitions": {"retail": {"_number": "State.obj"}}`. Each basename
-resolves from the target's configured `object_dir`, including when scoring an
-external `--object` candidate. The consumer must retain a recognized COMMON;
+resolves uniquely across the target's configured `object_dir` or `object_dirs`,
+including when scoring an external `--object` candidate. The consumer must retain a recognized COMMON;
 the provider must contain the same-name external, section-backed data definition.
 Its complete native extent and the complete data binding must both equal the
 COMMON request. All provider bytes and relocations are checked, even for an

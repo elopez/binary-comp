@@ -55,6 +55,7 @@ class ProjectTarget:
     preprocessor: PreprocessorConfig = PreprocessorConfig()
     original_sha256: str | None = None
     object_dir: str | None = None
+    object_dirs: tuple[str, ...] = ()
 
 
 def load_json(path: str | os.PathLike[str] | None) -> dict[str, Any]:
@@ -192,6 +193,18 @@ def _resolve_standalone_paths(values: tuple[str, ...], base: Path) -> tuple[str,
     return tuple(_resolve_standalone_path(value, base) or value for value in values)
 
 
+def _object_dirs(config: dict[str, Any], base: Path) -> tuple[str, ...]:
+    if "object_dirs" not in config:
+        return ()
+    if "object_dir" in config:
+        raise ConfigError("object_dir and object_dirs are mutually exclusive")
+    directories = config["object_dirs"]
+    if (not isinstance(directories, list) or not directories
+            or any(not isinstance(path, str) or not path for path in directories)):
+        raise ConfigError("object_dirs must be a nonempty list of directory strings")
+    return _resolve_standalone_paths(tuple(directories), base)
+
+
 def _build_config(config: dict[str, Any], inherited_jobs: int = 1) -> BuildConfig:
     build = config.get("build", {})
     if build is None:
@@ -296,6 +309,7 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
         ),
         original_sha256=optional_string(target_cfg, "original_sha256"),
         object_dir=_resolve_standalone_path(optional_string(target_cfg, "object_dir"), base),
+        object_dirs=_object_dirs(target_cfg, base),
     )
 
 
