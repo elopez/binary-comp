@@ -394,6 +394,21 @@ def test_final_inline_alignment_accepts_only_bounded_exact_short_instructions(tm
     assert window["excluded_nop_padding"] == 0
 
 
+def test_inter_table_padding_cannot_skip_a_four_byte_boundary(tmp_path):
+    coff, _, bindings, image = aligned_switch_tables(tmp_path)
+    section = coff.function("_dispatch")
+    # Every inserted byte is recognized padding, but six bytes would skip
+    # the first alignment boundary. Native symbols alone cannot authorize it.
+    section["data"] = section["data"][:14] + b"\x90" * 4 + section["data"][14:]
+    section["relocations"] = [(offset + (4 if offset >= 16 else 0), index, kind)
+                               for offset, index, kind in section["relocations"]]
+    for name in ("$second", "$second_index"):
+        coff.named[name]["value"] += 4
+        bindings[name]["va"] = hex(int(bindings[name]["va"], 16) + 4)
+    with pytest.raises(ValueError, match="Excessive or unaligned inline table padding"):
+        validate_data_binding(coff, "$first_index", bindings, image)
+
+
 @pytest.mark.parametrize("mutation", ["changed_gap", "unknown_gap", "changed_tail", "short_index",
                                      "long_index", "padding_fixup", "crossing_fixup", "next_symbol",
                                      "missing_pair", "excess_tail"])
