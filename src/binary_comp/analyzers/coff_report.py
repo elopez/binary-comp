@@ -454,6 +454,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 try:
                     actual, fixups = validate_data_binding(coff, name, bindings, reference)
                     row.update(exact=True, size=len(actual), checked_fixups=fixups)
+                    if coff.common_size(name) is not None:
+                        row.update(storage="common", object_file_bytes=0)
                 except (ValueError, KeyError) as exc:
                     row.update(exact=False, error=str(exc))
                 data_rows.append(row)
@@ -468,7 +470,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "relocated_bytes": "All original bytes vs body after explicit checked COFF fixups; no masks",
             "diagnostic_only": "Rejected extents compare the COFF section, or its code prefix before validated inline data, including padding; the strict gate error remains a failure",
             "mnemonic_similarity": "binary-comp normalized linear mnemonic Levenshtein score; ignores all operands",
-            "data": "Complete configured COFF definitions, including native inline tables, and explicit fixups validated with binary-comp positional comparison; excluded from code metrics",
+            "data": "Complete configured COFF definitions, including native inline tables and sectionless zero-initialized COMMON contributions, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
         "inputs": {

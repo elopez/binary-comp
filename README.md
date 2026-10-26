@@ -250,6 +250,21 @@ belong in a separate `code_labels` list with the same shape. Complete data
 definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
 weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
+
+Sectionless COMMON data is supported for native external symbols with section
+number zero and a positive Value (the requested byte count), as specified by
+the [PE/COFF symbol format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#section-number-values).
+A complete `data_size` or `data_hex` binding must cover that zero-initialized
+contribution at an explicit original VA; it has no file payload or data fixups.
+Pure undefined references, functions, weak symbols, auxiliary records,
+overlapping configured data owners, nonzero original bytes and partial
+contributions are rejected. Materialization
+is capped at 16 MiB; larger requested sizes remain available as metadata.
+`COFF.common_size()` and `materialize_common()` expose this sectionless storage;
+`definition_extent()` returns its requested size without inventing a section.
+This checks one object's COMMON request, not the largest coalesced allocation,
+final section layout, unique address identification, or linker ownership.
+
 Identical source aliases can remain address bindings while a single canonical
 body is listed in `functions`. Multiple typed function symbols in one code
 section are accepted only when all start at offset zero; either name selects

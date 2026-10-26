@@ -11,6 +11,11 @@ import struct
 from .binary import compare_binary
 
 
+# A symbol's requested size is metadata; materializing arbitrary 32-bit values
+# as host allocations is not safe. Larger contributions remain inspectable.
+MAX_COMMON_BYTES = 16 * 1024 * 1024
+
+
 def u16(data, offset):
     return struct.unpack_from("<H", data, offset)[0]
 
@@ -22,6 +27,14 @@ def u32(data, offset):
 def is_function_type(value):
     """Test the first COFF derived-type field, preserving any base return type."""
     return (value & 0x30) == 0x20
+
+
+def _is_common_symbol(symbol):
+    kind = symbol["type"]
+    return (symbol["section"] == 0 and symbol["value"] > 0
+            and symbol["storage"] == 2 and symbol.get("aux_count", 0) == 0
+            and not is_function_type(kind)
+            and ((kind & 0xF) != 1 or (kind & 0x30) == 0x10))
 
 
 def _is_ia32_alignment(data):
@@ -115,7 +128,7 @@ class COFF:
             if i + aux >= count:
                 raise ValueError("Truncated COFF auxiliary symbols")
             symbol = {"name": name, "value": value, "section": section,
-                      "type": kind, "storage": storage}
+                      "type": kind, "storage": storage, "aux_count": aux}
             if storage == 105:  # IMAGE_SYM_CLASS_WEAK_EXTERNAL
                 if aux != 1:
                     raise ValueError(f"Malformed weak external {name}")
@@ -129,10 +142,14 @@ class COFF:
                 previous = self.named.get(name)
                 if previous and previous["section"] > 0 and section > 0:
                     raise ValueError(f"Ambiguous symbol definitions for {name}")
+                if (previous and _is_common_symbol(previous) and _is_common_symbol(symbol)
+                        and previous["value"] != value):
+                    raise ValueError(f"Conflicting COMMON sizes for {name}")
                 # MSVC can emit an unresolved reference followed by its COMDAT
                 # definition. Preserve both indices; resolve names to the definition.
                 if (not previous or section > 0 or
-                        (previous["section"] == 0 and storage == 105)):
+                        (previous["section"] == 0 and not _is_common_symbol(previous)
+                         and (_is_common_symbol(symbol) or storage == 105))):
                     self.named[name] = symbol
             i += 1 + aux
 
@@ -152,7 +169,10 @@ class COFF:
             index = symbol["weak_fallback"]
 
     def definition_extent(self, name):
-        """Bound a complete definition by the next symbol or its section end."""
+        """Return a COMMON request size or a complete section-backed extent."""
+        common = self.common_size(name)
+        if common is not None:
+            return common
         symbol, section = self.definition(name)
         start = symbol["value"]
         end = min((s["value"] for s in self.symbols.values()
@@ -160,7 +180,26 @@ class COFF:
                   default=len(section["data"]))
         return end - start
 
+    def common_size(self, name):
+        """Return a sectionless COMMON contribution's size, or None.
+
+        This describes one object's request, not the final linker's coalesced
+        allocation, placement, or ownership. Undefined externs are not data.
+        """
+        symbol = self.named[name]
+        return symbol["value"] if _is_common_symbol(symbol) else None
+
+    def materialize_common(self, name):
+        """Materialize a bounded COMMON request as logical zeros, not a section."""
+        size = self.common_size(name)
+        if size is None:
+            raise ValueError(f"Not a COMMON data definition: {name}")
+        if size > MAX_COMMON_BYTES:
+            raise ValueError(f"COMMON contribution exceeds materialization limit: {name}")
+        return bytes(size)
+
     def definition(self, name):
+        """Return an actual section-backed definition; COMMON has no section."""
         symbol = self.named[name]
         if not 1 <= symbol["section"] <= len(self.sections):
             raise ValueError(f"Undefined symbol {name}")
@@ -306,8 +345,8 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
                 coff, coff.sections[symbol["section"] - 1], address, bindings)
         if "data_hex" in binding or "data_size" in binding:
             validate_data_binding(coff, name, bindings, reference, visiting)
-        elif (symbol["section"] != 0 and
-              not coff.sections[symbol["section"] - 1]["flags"] & 0x20):
+        elif (_is_common_symbol(symbol) or (symbol["section"] != 0 and
+              not coff.sections[symbol["section"] - 1]["flags"] & 0x20)):
             raise ValueError(f"Defined data symbol needs complete data validation: {name}")
         addend = u32(body, offset)
         if kind == 0x6:  # IMAGE_REL_I386_DIR32
@@ -327,18 +366,34 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
         raise ValueError(f"Cyclic data binding: {name}")
     binding = bindings[name]
     address = _binding_address(binding["va"], name)
+    common = coff.common_size(name)
+    if common is not None and common > MAX_COMMON_BYTES:
+        raise ValueError(f"COMMON contribution exceeds materialization limit: {name}")
     if "data_hex" in binding:
         if "data_size" in binding:
             raise ValueError(f"Ambiguous data size for {name}")
         expected = bytes.fromhex(binding["data_hex"])
-        if not expected or reference.read(address, len(expected)) != expected:
-            raise ValueError(f"Original constant differs for {name}")
         size = len(expected)
     else:
         size = binding["data_size"]
         if type(size) is not int or size <= 0:
             raise ValueError(f"Invalid data size for {name}")
+    if common is not None:
+        if "inline_data" in binding or "inline_index_for" in binding:
+            raise ValueError(f"COMMON data has no inline section: {name}")
+        if size != common:
+            raise ValueError(f"Configured data extent differs from COMMON contribution: {name}")
+        _validate_common_range(name, bindings, address, size)
+    if "data_hex" in binding:
+        if not expected or reference.read(address, size) != expected:
+            raise ValueError(f"Original constant differs for {name}")
+    else:
         expected = reference.read(address, size)
+    if common is not None:
+        actual = coff.materialize_common(name)
+        if not compare_binary(expected, actual).exact:
+            raise ValueError(f"Rebuilt data differs from original: {name}")
+        return actual, 0
     definition, section = coff.definition(name)
     inline = "inline_data" in binding
     if "inline_index_for" in binding and not inline:
@@ -386,6 +441,26 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None):
     if not compare_binary(expected, actual).exact:
         raise ValueError(f"Rebuilt data differs from original: {name}")
     return actual, fixups
+
+
+def _validate_common_range(name, bindings, address, size):
+    """Keep an explicit COMMON contribution bounded and separate from owners."""
+    if address + size > 0x100000000:
+        raise ValueError(f"COMMON contribution outside i386 address domain: {name}")
+    for other, binding in bindings.items():
+        if other == name:
+            continue
+        if "data_size" in binding:
+            length = binding["data_size"]
+        elif "data_hex" in binding:
+            length = len(bytes.fromhex(binding["data_hex"]))
+        else:
+            continue
+        if type(length) is not int or length <= 0:
+            raise ValueError(f"Invalid data size for {other}")
+        start = _binding_address(binding["va"], other)
+        if address < start + length and start < address + size:
+            raise ValueError(f"COMMON contribution overlaps configured data: {name}, {other}")
 
 
 def inline_table(coff, name, bindings):
