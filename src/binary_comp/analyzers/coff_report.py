@@ -14,12 +14,42 @@ from pathlib import Path
 import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
-from binary_comp.core.coff import (COFF, BodyExtentError, apply_fixups, code_window,
+from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
                                    compare_function, is_function_type, validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
 
 PE = FileBackedPEImage
+CODE_ROLES = (("functions", "function"), ("code_labels", "label"), ("code_regions", "region"))
+CODE_KEYS = tuple(key for key, _ in CODE_ROLES)
+
+
+def region_contracts(module):
+    """Filtering retains declared region dependencies without counting their rows."""
+    selected = module.get("code_regions", [])
+    return selected + [entry for entry in module.get("_code_region_dependencies", [])
+                       if entry not in selected]
+
+
+def ordinary_entries(module):
+    return [f for key in ("functions", "code_labels") for f in module.get(key, [])]
+
+
+def region_context(coff, module, version, bindings, reference, common_definitions):
+    contracts = region_contracts(module)
+    if not any(version in entry for entry in contracts):
+        return None
+    context = CodeRegions(coff, contracts, version, bindings, reference,
+                          common_definitions=common_definitions)
+    selected = ordinary_entries(module)
+    owners = selected + [entry for entry in module.get("_ordinary_code_owners", [])
+                         if entry not in selected]
+    for entry in owners:
+        if version in entry and entry["symbol"] in coff.named:
+            _, contribution = coff.definition(entry["symbol"])
+            if id(contribution) in context.sections:
+                raise ValueError("Duplicate COFF code contribution ownership")
+    return context
 
 
 def load_object(module, target):
@@ -150,7 +180,7 @@ def _code_bindings(bindings, entries, version):
         explicit = result.get(entry["symbol"])
         if explicit is not None and int(explicit["va"], 16) != int(entry[version]["va"], 16):
             raise ConfigError(f"Conflicting configured code address for {entry['symbol']}")
-        result[entry["symbol"]] = dict(entry[version])
+        result[entry["symbol"]] = {**(explicit or {}), **entry[version]}
     return result
 
 
@@ -195,6 +225,8 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
     for module in modules:
         if not isinstance(module, dict):
             raise ConfigError("COFF modules must be objects")
+        if {"_code_region_dependencies", "_ordinary_code_owners"} & module.keys():
+            raise ConfigError("COFF module uses reserved selection metadata")
         name = _component(module.get("name"), "COFF module name")
         if name in seen:
             raise ConfigError(f"Duplicate COFF module: {name}")
@@ -204,7 +236,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
         providers = _common_definition_records(module)
         if providers.keys() - target_configs.keys():
             raise ConfigError(f"Unknown COMMON provider target in {name}")
-        for key in ("functions", "code_labels"):
+        for key in CODE_KEYS:
             entries = module.get(key, [])
             if not isinstance(entries, list):
                 raise ConfigError(f"{name}.{key} must be a list")
@@ -212,6 +244,9 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 if (not isinstance(entry, dict) or not isinstance(entry.get("label"), str)
                         or not isinstance(entry.get("symbol"), str)):
                     raise ConfigError(f"Invalid COFF code entry in {name}.{key}")
+                if key == "code_regions":
+                    if not isinstance(entry.get("entries"), list) or not entry["entries"]:
+                        raise ConfigError("Code region needs an exhaustive typed-entry list")
                 for target_name in targets:
                     if target_name not in entry:
                         continue
@@ -235,29 +270,31 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                                                 or binding["data_size"] <= 0):
                     raise ConfigError(f"Invalid COFF data_size for {symbol}")
             _code_bindings(bindings.get(target_name, {}),
-                           [entry for key in ("functions", "code_labels")
-                            for entry in module.get(key, [])], target_name)
+                           ordinary_entries(module), target_name)
     if module_names:
         if set(module_names) - seen:
             raise ConfigError("Unknown COFF module: " + ", ".join(sorted(set(module_names) - seen)))
         modules = [m for m in modules if m["name"] in module_names]
     if function_name is not None:
+        if any(module.get("code_regions") for module in modules):
+            validate_counted_code(modules, list(targets))
         selected = []
         for module in modules:
-            entries = [(key, f) for key in ("functions", "code_labels")
+            entries = [(key, f) for key in CODE_KEYS
                        for f in module.get(key, [])
                        if function_name in (f["label"], f["symbol"])
                        and any(name in f for name in targets)]
             if not entries:
                 continue
             narrowed = dict(module)
+            narrowed["_code_region_dependencies"] = region_contracts(module)
+            narrowed["_ordinary_code_owners"] = ordinary_entries(module)
             # All function addresses remain available to code and data fixups.
             narrowed["bindings"] = {
                 name: _code_bindings(module.get("bindings", {}).get(name, {}),
-                                     [f for key in ("functions", "code_labels")
-                                      for f in module.get(key, [])], name)
+                                     ordinary_entries(module), name)
                 for name in targets}
-            for key in ("functions", "code_labels"):
+            for key in CODE_KEYS:
                 narrowed[key] = [f for role, f in entries if role == key]
             selected.append(narrowed)
         modules = selected
@@ -279,7 +316,7 @@ def run_config(config_path, target_name, output, *, module_names=None,
     if file_filter:
         modules = [m for m in modules if file_filter in m["name"]
                    or file_filter in m.get("source", "")
-                   or any(file_filter in f["label"] for key in ("functions", "code_labels")
+                   or any(file_filter in f["label"] for key in CODE_KEYS
                           for f in m.get(key, []))]
     # Build and input errors must not leave a previous green summary behind.
     for target in targets.values():
@@ -344,32 +381,34 @@ def compare_windows(label, address, original, raw, relocated):
 
 
 def diagnostic_bytes(coff, section, function, version, bindings, reference, *,
-                     common_definitions=None):
+                     common_definitions=None, code_regions=None):
     """Relocate a rejected complete code window without disassembly or report output."""
     target = function[version]
     address, size = int(target["va"], 16), target["size"]
     original = reference.read(address, size)
     window = code_window(coff, section, address, size, bindings, reference, diagnostic=True,
-                         common_definitions=common_definitions)
+                         common_definitions=common_definitions, code_regions=code_regions)
     bindings = window["bindings"]
+    code_regions = window.get("code_regions", code_regions)
     # Validate even unreferenced configured data before publishing diagnostics.
     # A length failure in the strict gate occurs before its relocation checks.
     for name, binding in bindings.items():
         if "data_hex" in binding or "data_size" in binding:
             validate_data_binding(coff, name, bindings, reference,
-                                  common_definitions=common_definitions)
+                                  common_definitions=common_definitions, code_regions=code_regions)
     raw = window["data"]
     rebuilt, fixups = apply_fixups(coff, raw, window["relocations"], address,
-                                  bindings, reference, common_definitions=common_definitions)
+                                  bindings, reference, common_definitions=common_definitions,
+                                  code_regions=window.get("code_regions", code_regions))
     return window, original, rebuilt, fixups
 
 
 def diagnostic_window(coff, section, function, version, bindings, reference, *,
-                      common_definitions=None):
+                      common_definitions=None, code_regions=None):
     """Review a rejected code extent, keeping explicitly validated native data separate."""
     window, original, rebuilt, fixups = diagnostic_bytes(
         coff, section, function, version, bindings, reference,
-        common_definitions=common_definitions)
+        common_definitions=common_definitions, code_regions=code_regions)
     address, size = int(function[version]["va"], 16), function[version]["size"]
     raw = window["data"]
     metrics, review = compare_windows(function["label"], address, original, raw, rebuilt)
@@ -406,7 +445,7 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     module = modules[0]
     functions = [f for f in module.get("functions", []) if target_name in f]
     labels = [f for f in module.get("code_labels", []) if target_name in f]
-    if len(functions) != 1 or labels:
+    if len(functions) != 1 or labels or any(target_name in r for r in module.get("code_regions", [])):
         raise ConfigError("COFF scoring requires exactly one native function")
     validate_counted_code(modules, [target_name])
     reference, _ = load_reference(targets[target_name], target_name)
@@ -416,21 +455,22 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     validate_native_role(coff, function["symbol"], "function")
     bindings = _code_bindings(module.get("bindings", {}).get(target_name, {}),
                               functions, target_name)
-    validate_common_definitions(coff, bindings, reference, common_definitions)
+    code_regions = region_context(coff, module, target_name, bindings, reference, common_definitions)
+    validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
     try:
         # Unreferenced configured definitions must pass the same data gate too.
         for name, binding in bindings.items():
             if "data_hex" in binding or "data_size" in binding:
                 validate_data_binding(coff, name, bindings, reference,
-                                      common_definitions=common_definitions)
+                                      common_definitions=common_definitions, code_regions=code_regions)
         try:
             _, rebuilt, original, _ = compare_function(
                 coff, function, target_name, bindings, reference,
-                common_definitions=common_definitions)
+                common_definitions=common_definitions, code_regions=code_regions)
         except BodyExtentError:
             _, original, rebuilt, _ = diagnostic_bytes(
                 coff, coff.function(function["symbol"]), function, target_name, bindings, reference,
-                common_definitions=common_definitions)
+                common_definitions=common_definitions, code_regions=code_regions)
             return max(1, compare_binary(original, rebuilt).differing_positions)
     except KeyError as error:
         raise ValueError(f"Missing configured COFF symbol: {error.args[0]}") from error
@@ -438,30 +478,45 @@ def score_config(config_path, target_name, function_name, object_path, *, module
 
 
 def validate_counted_code(modules, versions):
-    """Count each original code window once; aliases belong in bindings."""
+    """Disjoint original owners across code roles, including region dependencies."""
     for version in versions:
         symbols = set()
-        windows = []
+        windows, regions, data = [], [], []
         for module in modules:
-            for key in ("functions", "code_labels"):
-                for entry in module.get(key, []):
-                    if version not in entry:
-                        continue
-                    symbol = entry["symbol"]
-                    identity = module["name"], symbol
-                    if identity in symbols:
-                        raise ValueError(f"Duplicate counted COFF symbol for {version}: {symbol}")
-                    symbols.add(identity)
-                    binding = entry[version]
-                    start, size = int(binding["va"], 16), binding["size"]
+            entries = ordinary_entries(module) + region_contracts(module)
+            for entry in entries:
+                if version not in entry:
+                    continue
+                symbol = entry["symbol"]
+                identity = module["name"], symbol
+                if identity in symbols:
+                    raise ValueError(f"Duplicate counted COFF symbol for {version}: {symbol}")
+                symbols.add(identity)
+                binding = entry[version]
+                start, size = int(binding["va"], 16), binding["size"]
+                if type(size) is not int or size <= 0 or not 0 <= start < start + size <= 0x100000000:
+                    raise ValueError(f"Invalid counted COFF window for {version}: {symbol}")
+                window = start, start + size, module["name"], symbol
+                windows.append(window)
+                if entry in region_contracts(module):
+                    regions.append(window)
+            for name, binding in module.get("bindings", {}).get(version, {}).items():
+                if "data_hex" in binding or "data_size" in binding:
+                    size = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding
+                            else binding["data_size"])
+                    start = int(binding["va"], 16)
                     if type(size) is not int or size <= 0 or not 0 <= start < start + size <= 0x100000000:
-                        raise ValueError(f"Invalid counted COFF window for {version}: {symbol}")
-                    windows.append((start, start + size, module["name"], symbol))
+                        raise ValueError("Invalid complete COFF data range")
+                    data.append((start, start + size, module["name"], name))
         windows.sort()
         for left, right in zip(windows, windows[1:]):
             if left[1] > right[0]:
                 raise ValueError(f"Overlapping original COFF code windows for {version}: "
                                  f"{left[2]}:{left[3]} and {right[2]}:{right[3]}")
+        for region in regions:
+            for definition in data:
+                if region[0] < definition[1] and definition[0] < region[1]:
+                    raise ValueError("Code region overlaps configured complete data")
 
 
 def validate_native_role(coff, symbol, kind):
@@ -473,7 +528,7 @@ def validate_native_role(coff, symbol, kind):
     if kind == "function":
         if not is_function_type(definition["type"]):
             raise ValueError(f"Counted COFF function needs native function type: {symbol}")
-    else:
+    elif kind == "label":
         if definition["storage"] != 6 or definition["type"] != 0:
             raise ValueError(f"Counted COFF code label needs native storage 6/type 0: {symbol}")
         # The core also excludes local case labels inside a /Gy function section.
@@ -520,7 +575,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         reference, actual_hash = load_reference(target_config, version)
         reference_hashes[version] = actual_hash
         for module in modules:
-            entries = [(kind, f) for key, kind in (("functions", "function"), ("code_labels", "label"))
+            entries = [(kind, f) for key, kind in CODE_ROLES
                        for f in module.get(key, []) if version in f]
             if (not entries and not module.get("bindings", {}).get(version)
                     and not _common_definition_records(module).get(version)):
@@ -532,8 +587,10 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 validate_native_role(coff, function["symbol"], kind)
             object_hashes[f"{version}/{module['name']}"] = hashlib.sha256(coff.data).hexdigest()
             bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
-                                      [f for _, f in entries], version)
-            validate_common_definitions(coff, bindings, reference, common_definitions)
+                                      ordinary_entries(module), version)
+            code_regions = region_context(coff, module, version, bindings, reference, common_definitions)
+            validate_common_definitions(coff, bindings, reference, common_definitions,
+                                        code_regions=code_regions)
             register_external_bindings(external_bindings, coff, bindings, version, module["name"])
             for name, provider in common_definitions.items():
                 filename = module["common_definitions"][version][name]
@@ -549,13 +606,22 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 destination.unlink(missing_ok=True)
                 section = None
                 try:
-                    section = coff.function(function["symbol"])
-                    _, rebuilt, original, fixups = compare_function(
-                        coff, function, version, bindings, reference,
-                        common_definitions=common_definitions)
-                    window = code_window(coff, section, int(target["va"], 16), len(original),
-                                         bindings, reference,
-                                         common_definitions=common_definitions)
+                    if kind == "region":
+                        section = coff.code_region(function["symbol"], function["entries"])
+                        _, rebuilt, original, fixups = compare_code_region(
+                            coff, function, version, bindings, reference,
+                            common_definitions=common_definitions, code_regions=code_regions)
+                        window = {"data": section["data"], "excluded_nop_padding": 0}
+                        row["entries"] = [{**entry, "original_va": hex(int(target["va"], 16) + entry["offset"])}
+                                          for entry in function["entries"]]
+                    else:
+                        section = coff.function(function["symbol"])
+                        _, rebuilt, original, fixups = compare_function(
+                            coff, function, version, bindings, reference,
+                            common_definitions=common_definitions, code_regions=code_regions)
+                        window = code_window(coff, section, int(target["va"], 16), len(original),
+                                             bindings, reference,
+                                             common_definitions=common_definitions, code_regions=code_regions)
                     metrics, review = compare_windows(function["label"], int(target["va"], 16),
                                                       original, window["data"], rebuilt)
                     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -574,7 +640,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                         try:
                             metrics, review = diagnostic_window(
                                 coff, section, function, version, bindings, reference,
-                                common_definitions=common_definitions)
+                                common_definitions=common_definitions, code_regions=code_regions)
                             destination.parent.mkdir(parents=True, exist_ok=True)
                             destination.write_text("Strict matcher error: " + str(exc) + "\n\n" + review)
                             row.update(metrics, review=str(relative))
@@ -587,7 +653,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 row = {"version": version, "module": module["name"], "symbol": name}
                 try:
                     actual, fixups = validate_data_binding(coff, name, bindings, reference,
-                                                          common_definitions=common_definitions)
+                                                          common_definitions=common_definitions, code_regions=code_regions)
                     row.update(exact=True, size=len(actual), checked_fixups=fixups)
                     if coff.common_size(name) is not None:
                         row.update(storage="common", object_file_bytes=0)
@@ -605,7 +671,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     result = {
         "schema": 1,
         "tool": {"name": "binary-comp", "capstone": metadata.version("capstone")},
-        "scope": "Configured complete COFF function bodies and separate compiler code labels only",
+        "scope": "Configured complete COFF functions, compiler labels and separately counted complete code regions",
         "semantics": {
             "raw_bytes": "All original bytes vs COFF body before fixups; no masks",
             "relocated_bytes": "All original bytes vs body after explicit checked COFF fixups; no masks",
@@ -613,6 +679,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "mnemonic_similarity": "binary-comp normalized linear mnemonic Levenshtein score; ignores all operands",
             "data": "Complete configured COFF definitions, including native inline tables and sectionless COMMON contributions with logical zeros or explicitly selected strong providers, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
             "external_bindings": "Native storage-2 external address bindings agree by name within each selected target across selected modules and explicit COMMON providers; excludes static/local, weak, absolute and debug records; no claim about unselected objects or whole-link resolution",
+            "regions": "Complete multi-entry contributions including padding; entries are metadata, not independent function counts",
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
         "inputs": {
@@ -643,7 +710,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             details.append("diagnostic unavailable: " + row["diagnostic_error"])
         detail = "; ".join(details)
         lines.append(f"{row['version']} {row['kind']} {row['original_va']} {row['label']}: {detail}")
-    for kind in ("function", "label"):
+    for kind in ("function", "label", "region"):
         selected = [r for r in rows if r["kind"] == kind]
         raw = sum("error" not in r and r.get("raw_bytes", {}).get("exact", False) for r in selected)
         exact = sum("error" not in r and r.get("relocated_bytes", {}).get("exact", False) for r in selected)

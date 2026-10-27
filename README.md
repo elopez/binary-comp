@@ -362,6 +362,63 @@ is checked and decoded there. Rejected extents may receive full
 diagnostic reviews, but their failure remains visible and excluded from exact
 totals. These object comparisons do not establish whole-executable equality.
 
+A separate `code_regions` role compares a complete executable COFF contribution
+with typed entries at distinct offsets, without claiming independently complete
+functions. For example, using synthetic names and addresses:
+
+```json
+{
+  "name": "Sample",
+  "code_regions": [{
+    "label": "shared code contribution",
+    "symbol": "_entry_one",
+    "entries": [
+      {"symbol": "_entry_one", "offset": 0},
+      {"symbol": "_entry_two", "offset": 8}
+    ],
+    "retail": {"va": "0x10002000", "size": 32}
+  }],
+  "bindings": {"retail": {
+    "_entry_one": {"va": "0x10002000"},
+    "_entry_two": {"va": "0x10002008"}
+  }}
+}
+```
+
+The anchor must be typed at offset zero, and `entries` must exhaustively match
+all native typed records in the section, including static records with auxiliary
+metadata. At least two distinct offsets are required; co-located names may also
+be listed. Every entry needs an explicit, consistent address binding. The exact
+configured size must equal the whole contribution, including all padding; no
+subsection selection or tail trimming is allowed. The original range must be
+executable and completely file-backed. Regions may not overlap any configured
+code or complete data window, and a native contribution may have only one owner
+across functions, labels and regions. Inline-table roles inside regions are
+currently rejected rather than inferred or carved out of the code bytes.
+
+Ordinary DIR32/REL32 fixups and complete data/COMMON checks apply unchanged.
+Defined typed or local-label targets in a region must preserve their exact
+native offsets. Without an explicit region contract, references into a section
+with nonzero typed entries fail. Filtered function comparisons retain their
+same-object region contracts as uncounted dependencies: a reference to either
+entry validates the complete region bytes, all sibling entry bindings and its
+data dependencies. A context cannot authorize another object, reference or
+binding namespace, and successful byte results are not cached. Ordinary inline
+functions and compiler-label/function/zero-offset-alias gates remain strict.
+
+Reports use `kind: region` and separate region counts/byte totals, with entry
+addresses recorded as metadata. Entry names do not add function counts. Regions
+are not score targets; ordinary function scoring retains the same dependency
+checks. The core exposes `COFF.code_region()`, `compare_code_region()` and the
+single-owner `CodeRegions` context accepted by code/data comparison APIs.
+The region reference protocol additionally requires `section_for_va()` section
+metadata and strict file-backed reads; `FileBackedPEImage` supplies both.
+Configured unreferenced complete data must also pass before a region succeeds.
+COMMON providers continue to work with ordinary definitions, but a provider's
+own multi-entry code contribution is currently unsupported and fails explicitly;
+a consumer's region context never authorizes a provider with coincident section
+numbers. No provider-region owner or binding context is inferred automatically.
+
 External source searches can score a candidate object without replacing the
 configured object or generating a report:
 
