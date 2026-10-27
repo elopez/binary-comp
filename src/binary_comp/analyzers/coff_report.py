@@ -15,7 +15,8 @@ import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
-                                   compare_function, inline_table_alignment, is_function_type, validate_common_definitions,
+                                   compare_function, executable_data_definitions, executable_data_size,
+                                   inline_table_alignment, is_function_type, validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
 
@@ -35,16 +36,19 @@ def ordinary_entries(module):
     return [f for key in ("functions", "code_labels") for f in module.get(key, [])]
 
 
+def ordinary_owners(module):
+    selected = ordinary_entries(module)
+    return selected + [entry for entry in module.get("_ordinary_code_owners", [])
+                       if entry not in selected]
+
+
 def region_context(coff, module, version, bindings, reference, common_definitions):
     contracts = region_contracts(module)
     if not any(version in entry for entry in contracts):
         return None
     context = CodeRegions(coff, contracts, version, bindings, reference,
                           common_definitions=common_definitions)
-    selected = ordinary_entries(module)
-    owners = selected + [entry for entry in module.get("_ordinary_code_owners", [])
-                         if entry not in selected]
-    for entry in owners:
+    for entry in ordinary_owners(module):
         if version in entry and entry["symbol"] in coff.named:
             _, contribution = coff.definition(entry["symbol"])
             if id(contribution) in context.sections:
@@ -277,6 +281,10 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                                                 or binding["data_size"] <= 0):
                     raise ConfigError(f"Invalid COFF data_size for {symbol}")
                 inline_table_alignment(binding, symbol)
+                try:
+                    executable_data_size(symbol, binding)
+                except ValueError as error:
+                    raise ConfigError(str(error)) from error
             _code_bindings(bindings.get(target_name, {}),
                            ordinary_entries(module), target_name)
     if module_names:
@@ -489,9 +497,17 @@ def validate_counted_code(modules, versions):
     """Disjoint original owners across code roles, including region dependencies."""
     for version in versions:
         symbols = set()
-        windows, regions, data = [], [], []
+        windows, regions, data, dependencies = [], [], [], []
         for module in modules:
-            entries = ordinary_entries(module) + region_contracts(module)
+            selected = ordinary_entries(module)
+            for entry in ordinary_owners(module):
+                if entry not in selected and version in entry:
+                    target = entry[version]
+                    start, size = int(target["va"], 16), target["size"]
+                    if type(size) is not int or size <= 0 or not 0 <= start < start + size <= 0x100000000:
+                        raise ValueError("Invalid retained COFF owner range")
+                    dependencies.append((start, start + size))
+            entries = selected + region_contracts(module)
             for entry in entries:
                 if version not in entry:
                     continue
@@ -515,7 +531,9 @@ def validate_counted_code(modules, versions):
                     start = int(binding["va"], 16)
                     if type(size) is not int or size <= 0 or not 0 <= start < start + size <= 0x100000000:
                         raise ValueError("Invalid complete COFF data range")
-                    data.append((start, start + size, module["name"], name))
+                    executable_data_size(name, binding)
+                    data.append((start, start + size, module["name"], name,
+                                 "executable_data" in binding))
         windows.sort()
         for left, right in zip(windows, windows[1:]):
             if left[1] > right[0]:
@@ -525,6 +543,12 @@ def validate_counted_code(modules, versions):
             for definition in data:
                 if region[0] < definition[1] and definition[0] < region[1]:
                     raise ValueError("Code region overlaps configured complete data")
+        for index, definition in enumerate(data):
+            if not definition[4]:
+                continue
+            for other in windows + dependencies + [item for i, item in enumerate(data) if i != index]:
+                if definition[0] < other[1] and other[0] < definition[1]:
+                    raise ValueError("Executable data overlaps configured code or data")
 
 
 def validate_native_role(coff, symbol, kind):
@@ -579,6 +603,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     validate_counted_code(modules, versions)
     for version in versions:
         external_bindings = {}
+        native_data_owners = set()
         target_config = targets[version]
         reference, actual_hash = load_reference(target_config, version)
         reference_hashes[version] = actual_hash
@@ -596,6 +621,14 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             object_hashes[f"{version}/{module['name']}"] = hashlib.sha256(coff.data).hexdigest()
             bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
                                       ordinary_entries(module), version)
+            data_owners = executable_data_definitions(coff, bindings, reference,
+                                                      common_definitions=common_definitions)
+            for _, section, _, _ in data_owners.values():
+                identity = (object_path(target_config, module["name"] + ".obj").resolve(),
+                            next(i for i, native in enumerate(coff.sections) if native is section))
+                if identity in native_data_owners:
+                    raise ValueError("Duplicate native executable data contribution ownership")
+                native_data_owners.add(identity)
             code_regions = region_context(coff, module, version, bindings, reference, common_definitions)
             validate_common_definitions(coff, bindings, reference, common_definitions,
                                         code_regions=code_regions)
@@ -665,6 +698,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                     actual, fixups = validate_data_binding(coff, name, bindings, reference,
                                                           common_definitions=common_definitions, code_regions=code_regions)
                     row.update(exact=True, size=len(actual), checked_fixups=fixups)
+                    if "executable_data" in binding:
+                        row["storage"] = "executable"
                     if coff.common_size(name) is not None:
                         row.update(storage="common", object_file_bytes=0)
                         if name in common_definitions:

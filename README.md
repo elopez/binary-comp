@@ -285,6 +285,49 @@ definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
 weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
 
+Data deliberately stored in an executable COFF contribution requires an explicit
+binding-level opt-in, for example:
+
+```json
+"_lookup": {"va": "0x401080", "data_size": 16, "executable_data": true}
+```
+
+Only the exact boolean `true` is accepted. The native symbol must be the sole
+runtime definition in its section: untyped, storage 2 or 3, without auxiliaries,
+at offset zero. The complete `data_size` or `data_hex` must cover the entire raw
+contribution, including padding. The COFF section must retain its native code
+and executable flags, and the complete original window must be executable and
+file-backed within the i386 address domain. Ordinary data bindings continue to
+reject executable contributions. Extra runtime aliases, interior owners, typed
+entries, inline-data roles, COMMON and provider-owned executable data are not
+supported by this opt-in.
+
+Genuine section-definition auxiliary records are metadata only after their
+section identity, full length, relocation count and association fields agree.
+Legacy line tables and associative COMDAT metadata are unsupported for this role.
+Native auxiliary payloads remain available separately in
+`COFF.auxiliary_records`, keyed by the primary symbol index; symbol dictionaries
+and native relocation indices are unchanged. Pointers to section-auxiliary
+symbols in an executable-data contribution are rejected; pointers must target
+its actual runtime definition.
+
+The existing `validate_data_binding()` and `apply_fixups()` paths validate every
+payload byte and supported relocation. A complete header's pointer to this data
+recursively checks the entire target. Replacing an untyped runtime data target's
+complete binding with a bare VA cannot turn it into callable code. Existing
+typed functions and compiler code labels retain their own strict contracts.
+Configured executable-data owners cannot overlap other complete code, data or
+region owners, including across selected modules or retained filtered owners.
+The same native contribution cannot acquire duplicate data owners.
+
+No CLI flag or separate score is added: native COFF `report`, filtered `compare`
+and function `compare --score` consume the explicit manifest binding. Report and
+score validate unreferenced configured data too. Accepted rows remain in the
+data totals with `storage: "executable"`; they add no functions, code labels,
+regions or instruction-similarity metrics. These APIs require the same original
+section metadata and strict file-backed reference protocol as complete code
+regions. Shared external identities remain checked across the selected objects.
+
 Sectionless COMMON data is supported for native external symbols with section
 number zero and a positive Value (the requested byte count), as specified by
 the [PE/COFF symbol format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#section-number-values).

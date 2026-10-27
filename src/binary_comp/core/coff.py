@@ -3,9 +3,10 @@
 The parser retains native symbol indices, weak fallbacks and local labels. The
 comparison helpers accept explicit symbol/address bindings and a reference
 object with ``read(va, size)``; they never normalize arbitrary operands.
-Complete code regions additionally require ``section_for_va(va)`` returning
-section flags, start/end and rawsize, plus strictly file-backed reads. No
-compiler, linker, project layout or build command is assumed here.
+Complete code regions and explicit executable data additionally require
+``section_for_va(va)`` returning section flags, start/end and rawsize, plus
+strictly file-backed reads. No compiler, linker, project layout or build command
+is assumed here.
 """
 from copy import deepcopy
 from pathlib import Path
@@ -124,6 +125,7 @@ class COFF:
             })
         self.symbols = {}
         self.named = {}
+        self.auxiliary_records = {}
         i = 0
         while i < count:
             pos = symbol_table + i * 18
@@ -131,6 +133,8 @@ class COFF:
             value, section, kind, storage, aux = struct.unpack_from("<IhHBB", self.data, pos + 8)
             if i + aux >= count:
                 raise ValueError("Truncated COFF auxiliary symbols")
+            if aux:
+                self.auxiliary_records[i] = self.data[pos + 18:pos + 18 * (1 + aux)]
             symbol = {"name": name, "value": value, "section": section,
                       "type": kind, "storage": storage, "aux_count": aux}
             if storage == 105:  # IMAGE_SYM_CLASS_WEAK_EXTERNAL
@@ -379,9 +383,134 @@ def inline_table_alignment(binding, name):
     return alignment
 
 
+def executable_data_size(name, binding):
+    """Validate the explicit complete-data role, without inferring it from flags."""
+    if "executable_data" not in binding:
+        return None
+    if binding["executable_data"] is not True:
+        raise ValueError(f"executable_data must be true for {name}")
+    if ({"inline_data", "inline_index_for", "inline_alignment", "size"} & binding.keys()
+            or ("data_size" in binding) == ("data_hex" in binding)):
+        raise ValueError(f"Executable data needs one complete data extent and no code/inline role: {name}")
+    try:
+        size = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding
+                else binding["data_size"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid executable data extent for {name}") from error
+    if type(size) is not int or size <= 0:
+        raise ValueError(f"Invalid executable data extent for {name}")
+    return size
+
+
+def _is_section_definition(coff, symbol, section):
+    if (symbol["storage"] != 3 or symbol["type"] != 0 or symbol["value"] != 0
+            or symbol["aux_count"] != 1 or symbol["name"] != section["name"]
+            or not 1 <= symbol["section"] <= len(coff.sections)
+            or coff.sections[symbol["section"] - 1] is not section):
+        return False
+    index = next((i for i, native in coff.symbols.items() if native is symbol), None)
+    aux = coff.auxiliary_records.get(index, b"")
+    if len(aux) != 18:
+        return False
+    length, relocations, lines, _, number, selection, reserved, high = struct.unpack("<IHHIHBBH", aux)
+    header = 20 + (symbol["section"] - 1) * 40
+    if (length != len(section["data"]) or length != u32(coff.data, header + 16)
+            or relocations != len(section["relocations"]) or relocations != u16(coff.data, header + 32)
+            or lines or u16(coff.data, header + 34) or number or high or reserved
+            or section["flags"] != u32(coff.data, header + 36)
+            or section["name"] != coff.data[header:header + 8].rstrip(b"\0").decode("ascii")):
+        return False
+    # Associative COMDATs and legacy line tables need additional ownership.
+    return selection in (1, 2, 3, 4, 6, 7) if section["flags"] & 0x1000 else selection == 0
+
+
+def _is_untyped_runtime_symbol(symbol):
+    return symbol["storage"] in (2, 3) and symbol["type"] == 0 and symbol["aux_count"] == 0
+
+
+def _needs_executable_data_owner(coff, symbol, section):
+    if coff._section_functions(section):
+        return False
+    if _is_untyped_runtime_symbol(symbol):
+        return True
+    # A section-symbol relocation cannot hide the same runtime data target.
+    return (symbol["storage"] == 3 and symbol["type"] == 0 and symbol["aux_count"] > 0
+            and any(s["section"] == symbol["section"] and _is_untyped_runtime_symbol(s)
+                    for s in coff.symbols.values()))
+
+
+def executable_data_definitions(coff, bindings, reference, *, common_definitions=None):
+    """Check sole whole-section data owners; every call uses this actual COFF.
+
+    Section-definition auxiliary records are metadata, not runtime aliases.
+    Provider-owned executable data needs a separate namespace and is unsupported.
+    No byte comparison is cached; ordinary data recursion validates the payload.
+    """
+    owners = {}
+    provider = (isinstance(common_definitions, Mapping)
+                and any(coff is item for item in common_definitions.values()))
+    for name, binding in bindings.items():
+        inline_table_alignment(binding, name)
+        size = executable_data_size(name, binding)
+        if size is None:
+            continue
+        if provider:
+            if name in coff.named and coff.named[name]["section"] > 0:
+                raise ValueError("Provider-owned executable data is unsupported")
+            continue
+        if coff.common_size(name) is not None:
+            raise ValueError(f"Executable data cannot be COMMON: {name}")
+        definition, section = coff.definition(name)
+        if (definition["storage"] not in (2, 3) or definition["type"] != 0
+                or definition["aux_count"] != 0 or definition["value"] != 0
+                or not section["flags"] & 0x20 or not section["flags"] & 0x20000000
+                or section["flags"] & 0x80):
+            raise ValueError(f"Executable data needs a sole untyped executable definition at zero: {name}")
+        if size != len(section["data"]) or coff.definition_extent(name) != size:
+            raise ValueError(f"Executable data extent differs from complete COFF contribution: {name}")
+        metadata = 0
+        for symbol in coff.symbols.values():
+            if symbol["section"] != definition["section"] or symbol is definition:
+                continue
+            if _is_section_definition(coff, symbol, section):
+                metadata += 1
+                if metadata == 1:
+                    continue
+            raise ValueError(f"Executable data contribution has another native definition: {name}")
+        if id(section) in owners:
+            raise ValueError("Duplicate executable data contribution ownership")
+        address = _binding_address(binding["va"], name)
+        if address + size > 0x100000000:
+            raise ValueError(f"Executable data range outside i386 address domain: {name}")
+        if not callable(getattr(reference, "section_for_va", None)):
+            raise ValueError("Executable data requires original section metadata")
+        backing = reference.section_for_va(address)
+        if (backing is None or not backing.flags & 0x20000000
+                or address + size > backing.end
+                or address + size > backing.start + backing.rawsize):
+            raise ValueError("Executable data original range must be executable and file-backed")
+        reference.read(address, size)
+        for other, other_binding in bindings.items():
+            if other == name:
+                continue
+            length = (len(bytes.fromhex(other_binding["data_hex"])) if "data_hex" in other_binding
+                      else other_binding.get("data_size", other_binding.get("size")))
+            if length is None:
+                continue
+            start = _binding_address(other_binding["va"], other)
+            if type(length) is not int or length <= 0 or start + length > 0x100000000:
+                raise ValueError(f"Invalid complete COFF owner range: {other}")
+            if address < start + length and start < address + size:
+                raise ValueError(f"Executable data overlaps configured code or data: {name}, {other}")
+        owners[id(section)] = (name, section, address, size)
+    return owners
+
+
 def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None,
                  *, common_definitions=None, code_regions=None):
     _checked_origin(origin)
+    data_owners = executable_data_definitions(coff, bindings, reference,
+                                            common_definitions=common_definitions)
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
     if visiting is None:
@@ -402,7 +531,14 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
         if symbol["section"] != 0 and not 1 <= symbol["section"] <= len(coff.sections):
             raise ValueError(f"Unsupported relocation symbol section: {name}")
         if symbol["section"] > 0 and coff.sections[symbol["section"] - 1]["flags"] & 0x20:
-            if code_regions is not None:
+            section = coff.sections[symbol["section"] - 1]
+            owner = data_owners.get(id(section))
+            if owner is not None:
+                if name != owner[0] or address != owner[2]:
+                    raise ValueError("Executable data target differs from its complete owner")
+            elif _needs_executable_data_owner(coff, symbol, section):
+                raise ValueError(f"Untyped executable data target needs complete explicit validation: {name}")
+            elif code_regions is not None:
                 code_regions.validate_target(coff, symbol, address, visiting)
             else:
                 _validate_function_alias_bindings(
@@ -431,6 +567,7 @@ def validate_common_definitions(coff, bindings, reference, common_definitions=No
     Providers are already parsed objects. No file lookup, symbol search or
     section synthesis takes place in the core. All use the caller's bindings.
     """
+    executable_data_definitions(coff, bindings, reference, common_definitions=common_definitions)
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
     for name, binding in bindings.items():
@@ -470,6 +607,7 @@ def validate_common_definitions(coff, bindings, reference, common_definitions=No
 def validate_data_binding(coff, name, bindings, reference, visiting=None,
                           *, common_definitions=None, code_regions=None):
     """Compare a complete data definition, including all checked pointer fixups."""
+    executable_data_definitions(coff, bindings, reference, common_definitions=common_definitions)
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
     if visiting is None:
@@ -543,7 +681,8 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None,
         if "inline_index_for" in binding:
             validate_data_binding(coff, binding["inline_index_for"], bindings, reference,
                                   visiting | {identity}, common_definitions=common_definitions, code_regions=code_regions)
-    elif is_function_type(definition["type"]) or section["flags"] & 0x20:
+    elif ("executable_data" not in binding
+          and (is_function_type(definition["type"]) or section["flags"] & 0x20)):
         raise ValueError(f"Expected a data definition for {name}")
     if not inline and coff.definition_extent(name) != size:
         raise ValueError(f"Configured data extent differs from COFF definition: {name}")
@@ -612,6 +751,10 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
                 common_definitions=None, code_regions=None):
     """Bound code and native inline data once for both the gate and reviews."""
     _checked_origin(origin)
+    for _, owned_section, address, length in executable_data_definitions(
+            coff, bindings, reference, common_definitions=common_definitions).values():
+        if section is owned_section or (origin < address + length and address < origin + size):
+            raise ValueError("Code window overlaps a complete executable data contribution")
     validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
     if code_regions is not None:
         code_regions.validate_code_window(section, origin, size)
@@ -713,6 +856,7 @@ class CodeRegions:
         self.version = version
         for name, binding in self.bindings.items():
             inline_table_alignment(binding, name)
+        executable_data_definitions(coff, bindings, reference, common_definitions=common_definitions)
         self.regions = {}
         self.sections = {}
         for region in regions:
@@ -747,7 +891,8 @@ class CodeRegions:
         expected = deepcopy(self.bindings)
         previous = expected.get(owner)
         if previous is not None:
-            if ({"data_size", "data_hex", "inline_data", "inline_index_for", "inline_alignment"} & previous.keys()
+            if ({"data_size", "data_hex", "inline_data", "inline_index_for", "inline_alignment",
+                 "executable_data"} & previous.keys()
                     or _binding_address(previous["va"], owner) != origin):
                 raise ValueError("Code region context differs from code owner address or role")
         expected[owner] = {"va": hex(origin), "size": size}
