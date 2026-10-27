@@ -248,8 +248,12 @@ class COFF:
             raise ValueError("Code region requires distinct typed entry offsets")
         return section
 
-    def inline_table(self, name, size, *, index_entries=None):
+    def inline_table(self, name, size, *, index_entries=None, alignment=4):
         """Bound native local case pointers or byte indices in a /Gy code section."""
+        if type(alignment) is not int or alignment not in (1, 2, 4):
+            raise ValueError(f"Invalid inline_alignment for {name}")
+        if index_entries is not None and alignment != 4:
+            raise ValueError(f"inline_alignment requires a native pointer table: {name}")
         symbol, section = self.definition(name)
         if (not section["flags"] & 0x20 or symbol["storage"] != 6
                 or is_function_type(symbol["type"])):
@@ -281,7 +285,7 @@ class COFF:
                              for offset, index, kind in section["relocations"]
                              if start <= offset < end)
         if index_entries is None:
-            if (start % 4 or size % 4
+            if (start % alignment or size % 4
                     or [offset for offset, _, _ in relocations] != list(range(0, size, 4))
                     or any(kind != 0x6 for _, _, kind in relocations)):
                 raise ValueError(f"Inline table needs a complete contiguous DIR32 payload: {name}")
@@ -361,6 +365,20 @@ def _validate_function_alias_bindings(coff, section, origin, bindings):
             raise ValueError(f"Co-located function alias address differs from origin: {name}")
 
 
+def inline_table_alignment(binding, name):
+    """Validate the optional alignment contract only for explicit pointer tables."""
+    if "inline_alignment" not in binding:
+        return 4
+    alignment = binding["inline_alignment"]
+    if type(alignment) is not int or alignment not in (1, 2, 4):
+        raise ValueError(f"Invalid inline_alignment for {name}")
+    if (binding.get("inline_data") is not True
+            or type(binding.get("data_size")) is not int or binding["data_size"] <= 0
+            or {"data_hex", "inline_index_for", "executable_data"} & binding.keys()):
+        raise ValueError(f"inline_alignment requires inline_data=true and a complete pointer table: {name}")
+    return alignment
+
+
 def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None,
                  *, common_definitions=None, code_regions=None):
     _checked_origin(origin)
@@ -379,6 +397,7 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
         if name not in bindings:
             raise ValueError(f"Unresolved relocation: {name}")
         binding = bindings[name]
+        inline_table_alignment(binding, name)
         address = _binding_address(binding["va"], name)
         if symbol["section"] != 0 and not 1 <= symbol["section"] <= len(coff.sections):
             raise ValueError(f"Unsupported relocation symbol section: {name}")
@@ -414,6 +433,8 @@ def validate_common_definitions(coff, bindings, reference, common_definitions=No
     """
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
+    for name, binding in bindings.items():
+        inline_table_alignment(binding, name)
     if common_definitions is None:
         return
     if not isinstance(common_definitions, Mapping):
@@ -458,6 +479,7 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None,
     if identity in visiting:
         raise ValueError(f"Cyclic data binding: {name}")
     binding = bindings[name]
+    inline_table_alignment(binding, name)
     address = _binding_address(binding["va"], name)
     common = coff.common_size(name)
     if common is not None and common > MAX_COMMON_BYTES:
@@ -569,12 +591,13 @@ def _validate_common_range(name, bindings, address, size):
 def inline_table(coff, name, bindings):
     """Require explicit native table roles; never infer data by decoding bytes."""
     binding = bindings[name]
+    alignment = inline_table_alignment(binding, name)
     if (binding.get("inline_data") is not True or "data_size" not in binding
             or "data_hex" in binding):
         raise ValueError(f"Inline table requires inline_data=true and data_size: {name}")
     relation = binding.get("inline_index_for")
     if "inline_index_for" not in binding:
-        return coff.inline_table(name, binding["data_size"])
+        return coff.inline_table(name, binding["data_size"], alignment=alignment)
     if (not isinstance(relation, str) or relation not in bindings
             or "inline_index_for" in bindings[relation]):
         raise ValueError(f"Invalid inline byte-index relation: {name}")
@@ -620,7 +643,8 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
         table_regions = (None if code_regions is None else
                          code_regions.for_code_window(mapping, owner, origin, size))
         if not diagnostic:
-            if start != (size + 3) // 4 * 4:
+            alignment = inline_table_alignment(bindings[tables[0][0]], tables[0][0])
+            if start != (size + alignment - 1) // alignment * alignment:
                 raise BodyExtentError(f"Inline table offset {start} incompatible with original code extent {size}")
             gap = raw[size:start]
             if (any(byte != 0x90 for byte in gap)
@@ -687,6 +711,8 @@ class CodeRegions:
             raise ValueError("COMMON definitions must map names to COFF providers")
         self.common_definitions = None if common_definitions is None else dict(common_definitions)
         self.version = version
+        for name, binding in self.bindings.items():
+            inline_table_alignment(binding, name)
         self.regions = {}
         self.sections = {}
         for region in regions:
@@ -721,7 +747,7 @@ class CodeRegions:
         expected = deepcopy(self.bindings)
         previous = expected.get(owner)
         if previous is not None:
-            if ({"data_size", "data_hex", "inline_data", "inline_index_for"} & previous.keys()
+            if ({"data_size", "data_hex", "inline_data", "inline_index_for", "inline_alignment"} & previous.keys()
                     or _binding_address(previous["va"], owner) != origin):
                 raise ValueError("Code region context differs from code owner address or role")
         expected[owner] = {"va": hex(origin), "size": size}
@@ -771,7 +797,7 @@ class CodeRegions:
         for name, binding in self.bindings.items():
             symbol = self.coff.named.get(name)
             if symbol and symbol["section"] > 0 and self.coff.sections[symbol["section"] - 1] is section:
-                if "inline_data" in binding or "inline_index_for" in binding:
+                if {"inline_data", "inline_index_for", "inline_alignment"} & binding.keys():
                     raise ValueError("Inline data roles are unsupported in code regions")
             if "data_hex" in binding or "data_size" in binding:
                 length = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding

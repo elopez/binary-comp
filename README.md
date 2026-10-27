@@ -347,6 +347,13 @@ do not establish consistency with unselected objects or whole-link resolution.
 
 Native pointer tables in a code section require `inline_data: true` and a
 complete `data_size`; local case labels need their explicit original addresses.
+Pointer tables default to four-byte alignment. A binding may explicitly set
+`inline_alignment` to the integer `1`, `2` or `4` when its native table starts
+at that alignment; the first table must begin at the corresponding alignment
+boundary immediately after the complete configured code extent. This option
+requires `inline_data: true` and `data_size`, and cannot be used for byte-index
+tables, ordinary data, COMMON storage or executable-data contributions. Every
+pointer remains four bytes with an exact, contiguous native DIR32 fixup.
 Code sections with inline tables still require exactly one typed function
 symbol; table ownership is not inferred from co-located aliases.
 A following byte-index table also declares `inline_index_for` naming its pointer

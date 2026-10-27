@@ -15,7 +15,7 @@ import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
-                                   compare_function, is_function_type, validate_common_definitions,
+                                   compare_function, inline_table_alignment, is_function_type, validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
 
@@ -276,6 +276,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 if "data_size" in binding and (type(binding["data_size"]) is not int
                                                 or binding["data_size"] <= 0):
                     raise ConfigError(f"Invalid COFF data_size for {symbol}")
+                inline_table_alignment(binding, symbol)
             _code_bindings(bindings.get(target_name, {}),
                            ordinary_entries(module), target_name)
     if module_names:
