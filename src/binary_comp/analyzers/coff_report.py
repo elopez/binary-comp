@@ -247,6 +247,11 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 if key == "code_regions":
                     if not isinstance(entry.get("entries"), list) or not entry["entries"]:
                         raise ConfigError("Code region needs an exhaustive typed-entry list")
+                    anchor_offset = entry.get("anchor_offset", 0)
+                    if type(anchor_offset) is not int or anchor_offset < 0:
+                        raise ConfigError("Invalid code region anchor_offset")
+                elif "anchor_offset" in entry:
+                    raise ConfigError("anchor_offset is only supported for code_regions")
                 for target_name in targets:
                     if target_name not in entry:
                         continue
@@ -255,6 +260,8 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                             or binding["size"] <= 0 or not isinstance(binding.get("va"), str)):
                         raise ConfigError(f"Invalid complete COFF extent for {entry['label']}")
                     int(binding["va"], 16)
+                    if key == "code_regions" and anchor_offset >= binding["size"]:
+                        raise ConfigError("Code region anchor_offset outside complete extent")
         bindings = module.get("bindings", {})
         if not isinstance(bindings, dict) or any(not isinstance(b, dict) for b in bindings.values()):
             raise ConfigError(f"{name}.bindings must map target names to binding objects")
@@ -607,11 +614,13 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 section = None
                 try:
                     if kind == "region":
-                        section = coff.code_region(function["symbol"], function["entries"])
+                        section = coff.code_region(function["symbol"], function["entries"],
+                                                   anchor_offset=function.get("anchor_offset", 0))
                         _, rebuilt, original, fixups = compare_code_region(
                             coff, function, version, bindings, reference,
                             common_definitions=common_definitions, code_regions=code_regions)
                         window = {"data": section["data"], "excluded_nop_padding": 0}
+                        row["anchor_offset"] = function.get("anchor_offset", 0)
                         row["entries"] = [{**entry, "original_va": hex(int(target["va"], 16) + entry["offset"])}
                                           for entry in function["entries"]]
                     else:

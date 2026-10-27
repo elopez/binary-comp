@@ -385,11 +385,20 @@ functions. For example, using synthetic names and addresses:
 }
 ```
 
-The anchor must be typed at offset zero, and `entries` must exhaustively match
-all native typed records in the section, including static records with auxiliary
-metadata. At least two distinct offsets are required; co-located names may also
-be listed. Every entry needs an explicit, consistent address binding. The exact
-configured size must equal the whole contribution, including all padding; no
+The anchor must be typed at offset zero by default. A region with leading bytes
+can explicitly declare `"anchor_offset": 3`, for example, when its anchor's native
+section offset is three. This nonnegative integer must exactly match the native
+anchor and lie inside the complete contribution. The region's target `va` always
+denotes the whole section's origin; the anchor binding must equal that origin
+plus `anchor_offset`. Leading bytes and their relocations participate in the
+same complete comparison and are never skipped.
+
+The `entries` list must exhaustively match all native typed records in the
+section, including static records with auxiliary metadata. At least two distinct
+offsets are required; co-located names may also be listed. Every entry needs an
+explicit, consistent address binding at the section origin plus its native
+offset. The exact configured size must equal the whole contribution, including
+all padding; no
 subsection selection or tail trimming is allowed. The original range must be
 executable and completely file-backed. Regions may not overlap any configured
 code or complete data window, and a native contribution may have only one owner
@@ -411,6 +420,8 @@ addresses recorded as metadata. Entry names do not add function counts. Regions
 are not score targets; ordinary function scoring retains the same dependency
 checks. The core exposes `COFF.code_region()`, `compare_code_region()` and the
 single-owner `CodeRegions` context accepted by code/data comparison APIs.
+`COFF.code_region(name, entries, *, anchor_offset=0)` applies the same explicit
+anchor contract in the core API; reports retain `anchor_offset` as region metadata.
 The region reference protocol additionally requires `section_for_va()` section
 metadata and strict file-backed reads; `FileBackedPEImage` supplies both.
 Configured unreferenced complete data must also pass before a region succeeds.

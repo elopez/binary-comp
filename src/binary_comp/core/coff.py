@@ -215,12 +215,15 @@ class COFF:
                 and self.sections[s["section"] - 1] is section
                 and is_function_type(s["type"])]
 
-    def code_region(self, name, entries):
+    def code_region(self, name, entries, *, anchor_offset=0):
         """Select a complete multi-entry contribution from its native records."""
         anchor, section = self.definition(name)
+        if (type(anchor_offset) is not int
+                or not 0 <= anchor_offset < len(section["data"])):
+            raise ValueError("Invalid code region anchor_offset")
         if (not section["flags"] & 0x20 or not section["flags"] & 0x20000000
-                or not is_function_type(anchor["type"]) or anchor["value"] != 0):
-            raise ValueError("Code region needs a typed executable anchor at offset zero")
+                or not is_function_type(anchor["type"]) or anchor["value"] != anchor_offset):
+            raise ValueError("Code region needs a typed executable anchor at anchor_offset")
         if not isinstance(entries, list) or not entries:
             raise ValueError("Code region needs an exhaustive typed-entry list")
         expected = {}
@@ -692,7 +695,8 @@ class CodeRegions:
             name = region["symbol"]
             if name in self.regions:
                 raise ValueError("Duplicate code region owner")
-            section = self.coff.code_region(name, region.get("entries"))
+            section = self.coff.code_region(name, region.get("entries"),
+                                            anchor_offset=region.get("anchor_offset", 0))
             identity = id(section)
             if identity in self.sections:
                 raise ValueError("Duplicate COFF code contribution ownership")
@@ -736,7 +740,8 @@ class CodeRegions:
                 raise ValueError("Ordinary code overlaps a complete code region")
 
     def _metadata(self, region):
-        section = self.coff.code_region(region["symbol"], region.get("entries"))
+        section = self.coff.code_region(region["symbol"], region.get("entries"),
+                                        anchor_offset=region.get("anchor_offset", 0))
         target = region[self.version]
         origin = _binding_address(target["va"], region["symbol"])
         size = target["size"]

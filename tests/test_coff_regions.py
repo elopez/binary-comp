@@ -16,45 +16,60 @@ from conftest import DATA_VA, TEXT_VA, write_tiny_pe
 from test_coff_contract import coff_bytes, entry, DATA_FLAGS, inline_switch
 
 
-@pytest.fixture
-def shared(tmp_path):
+def make_shared(tmp_path, prefix=b"", *, prefix_reference=None, prefix_relocations=()):
     # Both native entries reach the shared load/return tail. References include
     # an internal call, a local branch label, an entry address and real data.
     code = bytearray(b"\x90" * 32)
     code[0:10] = b"\xe8" + bytes(4) + b"\xe9" + bytes(4)
     code[10:18] = b"\x68" + bytes(4) + b"\x58\xeb\x02"
     code[20:26] = b"\xa1" + bytes(4) + b"\xc3"
-    symbols = [{"name": "first", "section": 1, "type": 0x20},
-               {"name": "second", "section": 1, "value": 10, "type": 0x24},
+    start = len(prefix)
+    symbols = [{"name": "first", "section": 1, "value": start, "type": 0x20},
+               {"name": "second", "section": 1, "value": start + 10, "type": 0x24},
                {"name": "number", "section": 2},
-               {"name": "tail", "section": 1, "value": 20, "storage": 6},
+               {"name": "tail", "section": 1, "value": start + 20, "storage": 6},
                {"name": "caller", "section": 3, "type": 0x20},
                {"name": "pointer", "section": 2, "value": 4}]
     raw = coff_bytes([
-        {"data": bytes(code), "relocations": [(1, 1, 0x14), (6, 3, 0x14),
-                                               (11, 0, 6), (21, 2, 6)]},
+        {"data": prefix + bytes(code), "relocations": [*prefix_relocations,
+            (start + 1, 1, 0x14), (start + 6, 3, 0x14),
+            (start + 11, 0, 6), (start + 21, 2, 6)]},
         {"name": ".data", "flags": DATA_FLAGS, "data": struct.pack("<II", 7, 0),
          "relocations": [(4, 1, 6)]},
         {"data": b"\xe8" + bytes(4) + b"\xc3", "relocations": [(1, 1, 0x14)]},
     ], symbols)
     coff = COFF.from_bytes(raw)
-    original = bytearray(bytes(code) + b"\x90" * (0x80 - len(code)))
-    struct.pack_into("<I", original, 1, 5)
-    struct.pack_into("<I", original, 6, 10)
-    struct.pack_into("<I", original, 11, TEXT_VA)
-    struct.pack_into("<I", original, 21, DATA_VA)
-    original += b"\xe8" + struct.pack("<i", 10 - 0x85) + b"\xc3"
+    original = bytearray((prefix if prefix_reference is None else prefix_reference)
+                         + bytes(code) + b"\x90" * (0x80 - start - len(code)))
+    struct.pack_into("<I", original, start + 1, 5)
+    struct.pack_into("<I", original, start + 6, 10)
+    struct.pack_into("<I", original, start + 11, TEXT_VA + start)
+    struct.pack_into("<I", original, start + 21, DATA_VA)
+    original += b"\xe8" + struct.pack("<i", start + 10 - 0x85) + b"\xc3"
     image_path = tmp_path / "original.exe"
-    write_tiny_pe(image_path, original, {0: struct.pack("<II", 7, TEXT_VA + 10)})
+    write_tiny_pe(image_path, original, {0: struct.pack("<II", 7, TEXT_VA + start + 10)})
     image = FileBackedPEImage(image_path)
     region = {"label": "shared contribution", "symbol": "first",
-              "entries": [{"symbol": "first", "offset": 0}, {"symbol": "second", "offset": 10}],
-              "retail": {"va": hex(TEXT_VA), "size": 32}}
-    bindings = {"first": {"va": hex(TEXT_VA)}, "second": {"va": hex(TEXT_VA + 10)},
-                "tail": {"va": hex(TEXT_VA + 20)},
+              "entries": [{"symbol": "first", "offset": start},
+                          {"symbol": "second", "offset": start + 10}],
+              "retail": {"va": hex(TEXT_VA), "size": start + 32}}
+    if start:
+        region["anchor_offset"] = start
+    bindings = {"first": {"va": hex(TEXT_VA + start)}, "second": {"va": hex(TEXT_VA + start + 10)},
+                "tail": {"va": hex(TEXT_VA + start + 20)},
                 "number": {"va": hex(DATA_VA), "data_size": 4},
                 "pointer": {"va": hex(DATA_VA + 4), "data_size": 4}}
     return coff, region, bindings, image
+
+
+@pytest.fixture
+def shared(tmp_path):
+    return make_shared(tmp_path)
+
+
+@pytest.fixture
+def prefixed(tmp_path):
+    return make_shared(tmp_path, b"\x90\x90\x90")
 
 
 def context(shared, **kwargs):
@@ -65,6 +80,132 @@ def context(shared, **kwargs):
 def check(shared, **kwargs):
     c, r, b, image = shared
     return compare_code_region(c, r, "retail", b, image, **kwargs)
+
+
+def test_nonzero_anchor_compares_the_whole_section_and_preserves_function_guards(prefixed):
+    c, r, b, image = prefixed
+    assert c.code_region("first", r["entries"], anchor_offset=3) is c.sections[0]
+    with pytest.raises(ValueError, match="anchor_offset"):
+        c.code_region("first", r["entries"])
+    exact, actual, original, fixups = check(prefixed)
+    assert exact and actual == original and len(actual) == 35 and fixups == 4
+    assert original[:3] == b"\x90\x90\x90"
+    ctx = context(prefixed)
+    assert validate_data_binding(c, "pointer", b, image, code_regions=ctx)[1] == 1
+    assert compare_function(c, entry("caller", TEXT_VA + 0x80, 6), "sample", b, image,
+                            code_regions=ctx)[0]
+    for name in ("first", "second"):
+        with pytest.raises(ValueError, match="section offset zero"):
+            c.function(name)
+    with pytest.raises(ValueError, match="not separate code entries"):
+        c.function("tail")
+    with pytest.raises(ValueError, match="section offset zero"):
+        validate_data_binding(c, "pointer", b, image)
+
+
+def test_a_later_typed_anchor_does_not_change_the_region_origin(prefixed):
+    _, r, *_ = prefixed
+    r.update(symbol="second", anchor_offset=13)
+    assert check(prefixed)[0]
+
+
+@pytest.mark.parametrize("offset", [None, False, True, -1, 35, 36, 3.0, "3", [], {}])
+def test_anchor_offset_requires_an_in_range_integer(prefixed, offset):
+    c, r, *_ = prefixed
+    r["anchor_offset"] = offset
+    with pytest.raises(ValueError, match="anchor_offset"):
+        c.code_region("first", r["entries"], anchor_offset=offset)
+    with pytest.raises(ValueError, match="anchor_offset"):
+        check(prefixed)
+
+
+@pytest.mark.parametrize("offset", [0, 2, 4, 13])
+def test_declared_anchor_offset_must_equal_its_native_record(prefixed, offset):
+    prefixed[1]["anchor_offset"] = offset
+    with pytest.raises(ValueError, match="anchor_offset"):
+        check(prefixed)
+
+
+@pytest.mark.parametrize("mutation", ["missing declaration", "missing anchor", "missing sibling",
+                                      "moved entry", "origin", "anchor binding", "sibling binding"])
+def test_nonzero_anchor_cannot_shift_or_omit_native_ownership(prefixed, mutation):
+    _, r, b, _ = prefixed
+    if mutation == "missing declaration":
+        del r["anchor_offset"]
+    elif mutation == "missing anchor":
+        r["entries"].pop(0)
+    elif mutation == "missing sibling":
+        r["entries"].pop()
+    elif mutation == "moved entry":
+        r["entries"][0]["offset"] = 0
+    elif mutation == "origin":
+        r["retail"]["va"] = hex(TEXT_VA + 3)
+    elif mutation == "anchor binding":
+        b["first"]["va"] = hex(TEXT_VA)
+    else:
+        b["second"]["va"] = hex(TEXT_VA + 10)
+    with pytest.raises(ValueError):
+        check(prefixed)
+
+
+@pytest.mark.parametrize("offset", range(3))
+def test_nonzero_anchor_prefix_bytes_are_not_trimmed(prefixed, offset):
+    c, *_ = prefixed
+    raw = bytearray(c.sections[0]["data"])
+    raw[offset] ^= 1
+    c.sections[0]["data"] = bytes(raw)
+    assert not check(prefixed)[0]
+    with pytest.raises(ValueError, match="complete code region differs"):
+        compare_function(c, entry("caller", TEXT_VA + 0x80, 6), "sample", prefixed[2], prefixed[3],
+                         code_regions=context(prefixed))
+
+
+def test_nonzero_anchor_prefix_relocations_and_data_are_checked(tmp_path):
+    shared = make_shared(tmp_path, b"\xa1" + bytes(4),
+                         prefix_reference=b"\xa1" + struct.pack("<I", DATA_VA),
+                         prefix_relocations=[(1, 2, 6)])
+    c, _, b, image = shared
+    exact, actual, original, fixups = check(shared)
+    assert exact and actual == original and len(actual) == 37 and fixups == 5
+    # Only the relocation in the prefix changes; the entry bodies stay intact.
+    c.sections[0]["relocations"][0] = (1, 0, 6)
+    assert not check(shared)[0]
+    with pytest.raises(ValueError, match="complete code region differs"):
+        compare_function(c, entry("caller", TEXT_VA + 0x80, 6), "sample", b, image,
+                         code_regions=context(shared))
+    c.sections[0]["relocations"][0] = (1, 2, 6)
+    c.sections[1]["data"] = struct.pack("<II", 8, 0)
+    with pytest.raises(ValueError, match="Rebuilt data differs"):
+        check(shared)
+
+
+@pytest.mark.parametrize("mutation", ["anchor offset", "native offset", "entry binding", "prefix"])
+def test_nonzero_anchor_context_rechecks_contract_and_bytes(prefixed, mutation):
+    c, r, b, image = prefixed
+    ctx = context(prefixed)
+    assert check(prefixed, code_regions=ctx)[0]
+    if mutation == "anchor offset":
+        r["anchor_offset"] = 0
+    elif mutation == "native offset":
+        c.named["first"]["value"] = 4
+    elif mutation == "entry binding":
+        b["first"]["va"] = hex(TEXT_VA)
+    else:
+        c.sections[0]["data"] = b"\xcc" + c.sections[0]["data"][1:]
+        assert not check(prefixed, code_regions=ctx)[0]
+        return
+    with pytest.raises(ValueError, match="context|anchor_offset"):
+        compare_code_region(c, r, "retail", b, image, code_regions=ctx)
+
+
+def test_nonzero_anchor_prefix_cannot_overlap_data_or_an_ordinary_owner(prefixed):
+    c, _, b, image = prefixed
+    with pytest.raises(ValueError, match="Ordinary code overlaps"):
+        compare_function(c, entry("caller", TEXT_VA, 2), "sample", b, image,
+                         code_regions=context(prefixed))
+    b["number"]["va"] = hex(TEXT_VA + 1)
+    with pytest.raises(ValueError, match="overlaps configured complete data"):
+        check(prefixed)
 
 
 def test_complete_region_fixups_data_and_helper_inventory(shared):
@@ -127,19 +268,20 @@ def test_exhaustive_exact_entry_map(shared, mutation):
         check(shared)
 
 
-def test_static_auxiliary_entry_is_not_hidden():
-    c = COFF.from_bytes(coff_bytes([{"data": b"\xc3\x90\xc3"}], [
-        {"name": "first", "section": 1, "type": 0x20},
-        {"name": "second", "section": 1, "value": 2, "type": 0x24,
+@pytest.mark.parametrize("start", [0, 3])
+def test_static_auxiliary_entry_is_not_hidden(start):
+    c = COFF.from_bytes(coff_bytes([{"data": b"\x90" * start + b"\xc3\x90\xc3"}], [
+        {"name": "first", "section": 1, "value": start, "type": 0x20},
+        {"name": "second", "section": 1, "value": start + 2, "type": 0x24,
          "storage": 3, "aux": bytes(18)},
     ]))
-    entries = [{"symbol": "first", "offset": 0}, {"symbol": "second", "offset": 2}]
-    assert c.code_region("first", entries) is c.sections[0]
+    entries = [{"symbol": "first", "offset": start}, {"symbol": "second", "offset": start + 2}]
+    assert c.code_region("first", entries, anchor_offset=start) is c.sections[0]
     with pytest.raises(ValueError):
-        c.code_region("first", entries[:1])
+        c.code_region("first", entries[:1], anchor_offset=start)
     c.named["second"]["storage"] = 6
     with pytest.raises(ValueError, match="Unsupported native"):
-        c.code_region("first", entries)
+        c.code_region("first", entries, anchor_offset=start)
 
 
 @pytest.mark.parametrize("name", ["first", "second"])
@@ -276,8 +418,7 @@ def test_sole_nonzero_typed_entry_and_untyped_label_never_bypass_guard(tmp_path)
             validate_data_binding(c, "pointer", b, FileBackedPEImage(image_path))
 
 
-@pytest.fixture
-def region_project(shared, tmp_path):
+def make_region_project(shared, tmp_path):
     c, r, b, image = shared
     objects = tmp_path / "objects"
     objects.mkdir()
@@ -296,9 +437,114 @@ def region_project(shared, tmp_path):
     return config, manifest, tmp_path / "report", modules
 
 
+@pytest.fixture
+def region_project(shared, tmp_path):
+    return make_region_project(shared, tmp_path)
+
+
+@pytest.fixture
+def prefixed_project(prefixed, tmp_path):
+    return make_region_project(prefixed, tmp_path)
+
+
 def args(project, *extra):
     return ["report", "--config", str(project[0]), "--target", "retail", "--no-build",
             "--output", str(project[2]), *extra]
+
+
+def test_native_report_retains_nonzero_anchor_and_whole_region_origin(prefixed_project):
+    assert main(args(prefixed_project)) == 0
+    result = json.loads((prefixed_project[2] / "report.json").read_text())
+    row = result["code"][1]
+    assert row["kind"] == "region" and row["original_va"] == hex(TEXT_VA)
+    assert row["anchor_offset"] == 3 and row["body_size"] == 35
+    assert row["decoded_bytes"] == {"original": 35, "rebuilt": 35}
+    assert not row["raw_bytes"]["exact"] and row["relocated_bytes"]["exact"]
+    assert row["checked_fixups"] == 4 and row["excluded_nop_padding"] == 0
+    assert row["entries"] == [{"symbol": "first", "offset": 3, "original_va": hex(TEXT_VA + 3)},
+                               {"symbol": "second", "offset": 13, "original_va": hex(TEXT_VA + 13)}]
+    assert len(result["data"]) == 2 and all(row["exact"] for row in result["data"])
+
+
+@pytest.mark.parametrize("offset", [None, False, True, -1, 35, 3.0, "3", [], {}])
+def test_manifest_rejects_invalid_anchor_offsets_and_stale_success(prefixed_project, offset):
+    assert main(args(prefixed_project)) == 0
+    _, manifest, output, modules = prefixed_project
+    modules[0]["code_regions"][0]["anchor_offset"] = offset
+    manifest.write_text(json.dumps(modules))
+    assert main(args(prefixed_project)) == 2
+    assert not (output / "report.json").exists() and not (output / "report.txt").exists()
+
+
+@pytest.mark.parametrize("mutation", ["missing declaration", "wrong declaration", "entry binding", "origin"])
+def test_manifest_cannot_reinterpret_a_nonzero_anchor_as_region_origin(prefixed_project, mutation):
+    _, manifest, output, modules = prefixed_project
+    region = modules[0]["code_regions"][0]
+    if mutation == "missing declaration":
+        del region["anchor_offset"]
+    elif mutation == "wrong declaration":
+        region["anchor_offset"] = 4
+    elif mutation == "entry binding":
+        modules[0]["bindings"]["retail"]["first"]["va"] = hex(TEXT_VA)
+    else:
+        region["retail"]["va"] = hex(TEXT_VA + 3)
+    manifest.write_text(json.dumps(modules))
+    assert main(args(prefixed_project)) == 2
+    assert not (output / "report.json").exists()
+
+
+def test_anchor_offset_is_not_an_ordinary_function_opt_out(region_project):
+    _, manifest, _, modules = region_project
+    modules[0]["functions"][0]["anchor_offset"] = 1
+    manifest.write_text(json.dumps(modules))
+    assert main(args(region_project)) == 2
+
+
+@pytest.mark.parametrize("score", [False, True])
+def test_filtered_ordinary_comparison_rechecks_nonzero_entry_prefix(prefixed_project, capsys, score):
+    config, _, output, _ = prefixed_project
+    obj = config.parent / "objects/Sample.obj"
+    command = ["compare", "caller", "--config", str(config), "--target", "retail", "--no-build"]
+    command += ["--score", "--object", str(obj)] if score else ["--output", str(output)]
+    assert main(command) == 0
+    if score:
+        assert capsys.readouterr().out == "0\n"
+    else:
+        result = json.loads((output / "report.json").read_text())
+        assert [row["kind"] for row in result["code"]] == ["function"]
+    c = COFF(obj)
+    raw = bytearray(obj.read_bytes())
+    raw[raw.index(c.sections[0]["data"])] = 0xcc
+    obj.write_bytes(raw)
+    assert main(command) != 0
+    if score:
+        assert "complete code region differs" in capsys.readouterr().err
+    else:
+        result = json.loads((output / "report.json").read_text())
+        assert "complete code region differs" in result["code"][0]["error"]
+
+
+def test_filtered_nonzero_entry_dependency_rechecks_prefix_fixups(tmp_path):
+    shared = make_shared(tmp_path, b"\xa1" + bytes(4),
+                         prefix_reference=b"\xa1" + struct.pack("<I", DATA_VA),
+                         prefix_relocations=[(1, 2, 6)])
+    project = make_region_project(shared, tmp_path)
+    command = ["compare", "caller", "--config", str(project[0]), "--target", "retail",
+               "--no-build", "--output", str(project[2])]
+    assert main(command) == 0
+    c = shared[0]
+    c.sections[0]["relocations"][0] = (1, 0, 6)
+    (tmp_path / "objects/Sample.obj").write_bytes(coff_bytes(c.sections, c.symbols.values()))
+    assert main(command) != 0
+    result = json.loads((project[2] / "report.json").read_text())
+    assert "complete code region differs" in result["code"][0]["error"]
+
+
+def test_nonzero_anchor_region_is_not_a_score_target(prefixed_project, capsys):
+    assert main(["compare", "first", "--config", str(prefixed_project[0]), "--target", "retail",
+                 "--module", "Sample", "--no-build", "--score", "--object",
+                 str(prefixed_project[0].parent / "objects/Sample.obj")]) == 2
+    assert "exactly one native function" in capsys.readouterr().err
 
 
 def test_native_report_has_separate_region_metrics_and_entry_metadata(region_project, capsys):
