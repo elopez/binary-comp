@@ -496,3 +496,119 @@ def test_only_explicit_core_opt_in_adds_a_capstone_requirement(vectors, monkeypa
         check(vectors)
     del vectors[1]["inline_vectors"]
     assert check(vectors)[0]
+
+
+def public_region_dependency(api, fixture, ctx, visiting):
+    c, _, b, image = fixture
+    if api == "data":
+        return validate_data_binding(c, "pointer", b, ctx.reference, visiting, code_regions=ctx)
+    if api == "target":
+        return ctx.validate_target(c, c.named["first"], TEXT_VA + 3, visiting)
+    section, origin = (c.sections[2], DATA_VA) if api == "data fixups" else (c.sections[1], TEXT_VA + 256)
+    return apply_fixups(c, section["data"], section["relocations"], origin,
+                        b, ctx.reference, visiting, code_regions=ctx)
+
+
+@pytest.mark.parametrize("api", ["data", "target", "data fixups", "caller fixups"])
+@pytest.mark.parametrize("path", ["forged region", "unrelated", "both"])
+def test_caller_visiting_sets_cannot_skip_complete_region_decode(vectors, api, path):
+    c = vectors[0]
+    ctx = context(vectors)
+    assert check(vectors, ctx)[0]
+    mutate_byte(vectors, 63, 0x0f, both=True)
+    identity = ("code region", id(c), id(c.sections[0]))
+    visiting = {identity} if path == "forged region" else {(id(c), "unrelated")}
+    if path == "both":
+        visiting.add(identity)
+    before = set(visiting)
+    message = "active native validation" if identity in visiting else "every original instruction byte"
+    with pytest.raises(ValueError, match=message):
+        public_region_dependency(api, vectors, ctx, visiting)
+    assert visiting == before
+
+
+@pytest.mark.parametrize("mutation", ["vector type", "entry offset", "original payload"])
+@pytest.mark.parametrize("api", ["data", "target", "data fixups"])
+def test_forged_region_recursion_cannot_reuse_stale_native_or_original_inputs(vectors, api, mutation):
+    c, _, _, image = vectors
+    ctx = context(vectors)
+    assert check(vectors, ctx)[0]
+    if mutation == "vector type":
+        c.named["vector_a"]["type"] = 0x20
+    elif mutation == "entry offset":
+        c.named["last"]["value"] += 1
+    else:
+        raw = bytearray(image.data)
+        raw[image.section_for_va(TEXT_VA).rawptr + 16] ^= 1
+        image.data = bytes(raw)
+    visiting = {("code region", id(c), id(c.sections[0]))}
+    with pytest.raises(ValueError):
+        public_region_dependency(api, vectors, ctx, visiting)
+
+
+class RegionCallbackReference:
+    """Invoke a public callback during the first internal target validation."""
+
+    def __init__(self, image):
+        self.image = image
+        self.callback = None
+        self.whole_reads = 0
+
+    def section_for_va(self, address):
+        return self.image.section_for_va(address)
+
+    def read(self, address, size):
+        if self.callback is not None and (address, size) == (TEXT_VA, 160):
+            self.whole_reads += 1
+            if self.whole_reads == 2:
+                callback, self.callback = self.callback, None
+                callback()
+        return self.image.read(address, size)
+
+
+@pytest.mark.parametrize("api", ["data", "target", "data fixups", "caller fixups"])
+def test_public_reentry_cannot_borrow_an_active_regions_recursion_permission(vectors, api):
+    c, r, b, image = vectors
+    reference = RegionCallbackReference(image)
+    ctx = CodeRegions(c, [r], "retail", b, reference)
+    observed = []
+
+    def callback():
+        # Equal malformed buffers must not be accepted just because an outer
+        # native comparison is currently traversing this region's fixups.
+        mutate_byte(vectors, 63, 0x0f, both=True)
+        try:
+            with pytest.raises(ValueError, match="active native validation"):
+                public_region_dependency(api, vectors, ctx,
+                    {("code region", id(c), id(c.sections[0]))})
+            observed.append("rejected")
+        finally:
+            mutate_byte(vectors, 63, 0x90, both=True)
+
+    reference.callback = callback
+    assert ctx.compare("first")[0]
+    assert observed == ["rejected"]
+    assert validate_data_binding(c, "pointer", b, reference, code_regions=ctx)[1] == 1
+
+
+@pytest.mark.parametrize("outer_fails", [False, True])
+@pytest.mark.parametrize("api", ["data", "target", "data fixups"])
+def test_copied_context_cannot_reuse_region_permission_after_operation_exit(vectors, outer_fails, api):
+    from contextvars import copy_context
+
+    c, r, b, image = vectors
+    reference = RegionCallbackReference(image)
+    ctx = CodeRegions(c, [r], "retail", b, reference)
+    copied = []
+    reference.callback = lambda: copied.append(copy_context())
+    if outer_fails:
+        mutate_byte(vectors, 63, 0x0f, both=True)
+        with pytest.raises(ValueError, match="every original instruction byte"):
+            ctx.compare("first")
+    else:
+        assert ctx.compare("first")[0]
+        mutate_byte(vectors, 63, 0x0f, both=True)
+    assert len(copied) == 1
+    with pytest.raises(ValueError, match="active native validation"):
+        copied[0].run(public_region_dependency, api, vectors, ctx,
+                      {("code region", id(c), id(c.sections[0]))})

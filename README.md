@@ -539,6 +539,8 @@ entry validates the complete region bytes, all sibling entry bindings and its
 data dependencies. A context cannot authorize another object, reference or
 binding namespace, and successful byte results are not cached. Ordinary inline
 functions and compiler-label/function/zero-offset-alias gates remain strict.
+Caller-supplied recursion sets cannot authorize a region: only the same active
+native comparison may break its internal pointer cycles.
 
 Reports use `kind: region` and separate region counts/byte totals, with entry
 addresses recorded as metadata. Entry names do not add function counts. Regions

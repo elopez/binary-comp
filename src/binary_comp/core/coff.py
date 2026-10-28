@@ -632,6 +632,8 @@ class _LayoutOperation:
         self.reference = reference
         self.providers = dict(providers) if isinstance(providers, Mapping) else providers
         self.regions = regions
+        # Only live native fixup paths; never completed-validation authority.
+        self.region_validations = set()
         self.active = True
 
     def matches(self, coff, bindings, reference, providers, regions):
@@ -1341,15 +1343,21 @@ class CodeRegions:
         origin = _binding_address(region[self.version]["va"], name)
         visiting = set() if visiting is None else visiting
         identity = ("code region", id(self.coff), id(section))
-        if identity in visiting:
+        operation = _layout_operation.get()
+        if (operation is None or not operation.matches(
+                self.coff, self.bindings, self.reference, self.common_definitions, self)):
+            raise ValueError("Code region needs an active native comparison operation")
+        if identity in visiting or identity in operation.region_validations:
             raise ValueError("Recursive code region comparison")
         visiting.add(identity)
+        operation.region_validations.add(identity)
         try:
             actual, fixups = _layout_call(apply_fixups,
                 self.coff, section["data"], section["relocations"], origin,
                 self.bindings, self.reference, visiting,
                 common_definitions=self.common_definitions, code_regions=self)
         finally:
+            operation.region_validations.remove(identity)
             visiting.remove(identity)
         expected = self.reference.read(origin, len(section["data"]))
         if "inline_vectors" in region:
@@ -1382,7 +1390,15 @@ class CodeRegions:
         if not 0 <= symbol["value"] < len(section["data"]) or address != origin + symbol["value"]:
             raise ValueError("Code region target differs from its native offset")
         identity = ("code region", id(coff), id(section))
-        if visiting is None or identity not in visiting:
+        if visiting is not None and identity in visiting:
+            # Public recursion sets carry no authority. Only an authenticated
+            # internal call in this operation may break a live region cycle.
+            operation = _layout_operation.get()
+            if (operation is None or not operation.matches(
+                    coff, self.bindings, self.reference, self.common_definitions, self)
+                    or identity not in operation.region_validations):
+                raise ValueError("Code region recursion needs active native validation")
+        else:
             if not _layout_call(self.compare, region["symbol"], visiting)[0]:
                 raise ValueError("Referenced complete code region differs from original")
 
