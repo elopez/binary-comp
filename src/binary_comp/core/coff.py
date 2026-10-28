@@ -373,6 +373,8 @@ def _validate_function_alias_bindings(coff, section, origin, bindings):
 
 def inline_table_alignment(binding, name):
     """Validate the optional alignment contract only for explicit pointer tables."""
+    if "inline_vectors" in binding:
+        raise ValueError(f"inline_vectors is only supported for code_regions: {name}")
     if "inline_alignment" not in binding:
         return 4
     alignment = binding["inline_alignment"]
@@ -1081,6 +1083,8 @@ def compare_function(coff, function, version, bindings, reference, *,
 
 
 def _compare_function(coff, function, version, bindings, reference, *, common_definitions=None, code_regions=None):
+    if "inline_vectors" in function:
+        raise ValueError("inline_vectors is only supported for code_regions")
     _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
         code_regions=code_regions)
     target = function[version]
@@ -1090,6 +1094,26 @@ def _compare_function(coff, function, version, bindings, reference, *, common_de
         common_definitions=common_definitions, code_regions=code_regions)
     expected = reference.read(address, size)
     return compare_binary(expected, actual).exact, actual, expected, relocations
+
+
+def inline_vector_records(region):
+    """Validate region-only native vector declarations, never arbitrary ranges."""
+    if "inline_vectors" not in region:
+        return []
+    records = region["inline_vectors"]
+    if not isinstance(records, list) or not records:
+        raise ValueError("inline_vectors must be a nonempty list")
+    seen = set()
+    for record in records:
+        if (not isinstance(record, Mapping) or set(record) != {"symbol", "size"}
+                or not isinstance(record["symbol"], str) or not record["symbol"]
+                or type(record["size"]) is not int or record["size"] <= 0
+                or record["size"] % 4):
+            raise ValueError("Invalid inline_vectors record")
+        if record["symbol"] in seen:
+            raise ValueError("Duplicate inline_vectors symbol")
+        seen.add(record["symbol"])
+    return records
 
 
 class CodeRegions:
@@ -1115,6 +1139,7 @@ class CodeRegions:
         self.regions = {}
         self.sections = {}
         for region in regions:
+            inline_vector_records(region)
             if version not in region:
                 continue
             name = region["symbol"]
@@ -1208,7 +1233,100 @@ class CodeRegions:
                     raise ValueError("Invalid complete data extent")
                 if origin < address + length and address < origin + size:
                     raise ValueError("Code region overlaps configured complete data")
+        self._inline_vectors(region, section)
         return section
+
+    def _inline_vectors(self, region, section):
+        """Require complete native static DIR32 definitions within this owner."""
+        origin = _binding_address(region[self.version]["va"], region["symbol"])
+        entries = {entry["symbol"]: entry["offset"] for entry in region["entries"]}
+        vectors = []
+        for record in inline_vector_records(region):
+            name, size = record["symbol"], record["size"]
+            symbol, owner = self.coff.definition(name)
+            start, end = symbol["value"], symbol["value"] + size
+            if (owner is not section or symbol["storage"] != 3 or symbol["type"] != 0
+                    or symbol["aux_count"] or start % 4
+                    or not 0 <= start < end <= len(section["data"])
+                    or self.coff.definition_extent(name) != size):
+                raise ValueError(f"Inline vector needs a complete aligned native static definition: {name}")
+            binding = self.bindings.get(name)
+            if (binding is None or _binding_address(binding["va"], name) != origin + start
+                    or {"size", "data_size", "data_hex", "inline_data", "inline_index_for",
+                        "inline_alignment", "executable_data", "section_layout"} & binding.keys()):
+                raise ValueError(f"Inline vector needs its exact address-only binding: {name}")
+            if any(start <= offset < end for offset in entries.values()):
+                raise ValueError(f"Code region entry overlaps inline vector: {name}")
+            if any(offset < start < offset + 4 or offset < end < offset + 4
+                   for offset, _, _ in section["relocations"]):
+                raise ValueError(f"Relocation crosses inline vector boundary: {name}")
+            relocations = sorted((offset, index, kind) for offset, index, kind
+                                 in section["relocations"] if start <= offset < end)
+            if ([offset for offset, _, _ in relocations] != list(range(start, end, 4))
+                    or any(kind != 0x6 for _, _, kind in relocations)):
+                raise ValueError(f"Inline vector needs a complete contiguous DIR32 payload: {name}")
+            for offset, index, _ in relocations:
+                native = self.coff.symbols.get(index)
+                target = self.coff.resolve_symbol(index)
+                if (native is None or native["storage"] not in (2, 3)
+                        or not is_function_type(native["type"])
+                        or native["section"] != symbol["section"]
+                        or entries.get(native["name"]) != native["value"]
+                        or target["section"] != symbol["section"]
+                        or target["storage"] not in (2, 3) or not is_function_type(target["type"])
+                        or entries.get(target["name"]) != target["value"]):
+                    raise ValueError(f"Inline vector target is not a declared typed region entry: {name}")
+                if u32(section["data"], offset):
+                    raise ValueError(f"Inline vector addend must be zero: {name}")
+            vectors.append({"symbol": name, "offset": start, "size": size,
+                            "checked_fixups": len(relocations)})
+        vectors.sort(key=lambda vector: vector["offset"])
+        if any(a["offset"] + a["size"] > b["offset"] for a, b in zip(vectors, vectors[1:])):
+            raise ValueError("Overlapping inline vectors")
+        return vectors
+
+    def decode_vectors(self, name, original, relocated):
+        """Revalidate this opt-in and decode every remaining byte, without trimming.
+
+        Capstone is required only by this explicit core opt-in. This returns
+        instruction accounting, not permission to omit bytes from equality.
+        """
+        from .disasm import disassemble_raw
+
+        region = self.regions[name]
+        section = self._metadata(region)
+        if self.sections.get(id(section)) is not region or "inline_vectors" not in region:
+            raise ValueError("Invalid inline-vector region context")
+        vectors = self._inline_vectors(region, section)
+        size = len(section["data"])
+        if len(original) != size or len(relocated) != size:
+            raise ValueError("Inline-vector decoding requires both complete region windows")
+        origin = _binding_address(region[self.version]["va"], name)
+        ranges, cursor = [], 0
+        for vector in vectors:
+            if cursor < vector["offset"]:
+                ranges.append((cursor, vector["offset"]))
+            cursor = vector["offset"] + vector["size"]
+        if cursor < size:
+            ranges.append((cursor, size))
+        decoded = {}
+        for role, payload in (("original", original), ("rebuilt", relocated)):
+            instructions = []
+            for start, end in ranges:
+                part = disassemble_raw(payload[start:end], origin + start)
+                cursor = origin + start
+                for instruction in part:
+                    if instruction.address != cursor or instruction.size <= 0:
+                        raise ValueError("Inline-vector instruction coverage is not contiguous")
+                    cursor += instruction.size
+                if cursor != origin + end:
+                    raise ValueError(f"Inline-vector decoding did not cover every {role} instruction byte")
+                instructions.extend(part)
+            starts = {instruction.address - origin for instruction in instructions}
+            if any(entry["offset"] not in starts for entry in region["entries"]):
+                raise ValueError(f"Code region entry is not a decoded {role} instruction boundary")
+            decoded[role] = instructions
+        return decoded, vectors
 
     def compare(self, name, visiting=None):
         with _validate_section_layouts(self.coff, self.bindings, self.reference,
@@ -1234,6 +1352,8 @@ class CodeRegions:
         finally:
             visiting.remove(identity)
         expected = self.reference.read(origin, len(section["data"]))
+        if "inline_vectors" in region:
+            self.decode_vectors(name, expected, actual)
         return compare_binary(expected, actual).exact, actual, expected, fixups
 
     def validate_target(self, coff, symbol, address, visiting):

@@ -16,7 +16,7 @@ import re
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
                                    compare_function, executable_data_definitions, executable_data_size,
-                                   inline_table_alignment, is_function_type, section_layout_definitions, section_layout_size,
+                                   inline_table_alignment, inline_vector_records, is_function_type, section_layout_definitions, section_layout_size,
                                    validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
@@ -250,6 +250,10 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                         or not isinstance(entry.get("symbol"), str)):
                     raise ConfigError(f"Invalid COFF code entry in {name}.{key}")
                 if key == "code_regions":
+                    try:
+                        inline_vector_records(entry)
+                    except ValueError as error:
+                        raise ConfigError(str(error)) from error
                     if not isinstance(entry.get("entries"), list) or not entry["entries"]:
                         raise ConfigError("Code region needs an exhaustive typed-entry list")
                     anchor_offset = entry.get("anchor_offset", 0)
@@ -257,6 +261,8 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                         raise ConfigError("Invalid code region anchor_offset")
                 elif "anchor_offset" in entry:
                     raise ConfigError("anchor_offset is only supported for code_regions")
+                if key != "code_regions" and "inline_vectors" in entry:
+                    raise ConfigError("inline_vectors is only supported for code_regions")
                 for target_name in targets:
                     if target_name not in entry:
                         continue
@@ -321,6 +327,15 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
     return modules, targets, paths[0] if len(paths) == 1 else paths
 
 
+def _invalidate_report_outputs(output):
+    """Remove only this backend's summaries and generated per-body reviews."""
+    for filename in ("report.json", "report.txt"):
+        (output / filename).unlink(missing_ok=True)
+    for path in output.glob("*/*/*.txt"):
+        if re.fullmatch(r"[0-9a-f]{8}-(function|label|region)\.txt", path.name):
+            path.unlink(missing_ok=True)
+
+
 def run_config(config_path, target_name, output, *, module_names=None,
                function_name=None, file_filter=None, build=False, show_reviews=False):
     """Run the same strict backend from the compare and report CLI commands."""
@@ -328,8 +343,7 @@ def run_config(config_path, target_name, output, *, module_names=None,
 
     # Invalidate summaries even when selection or configuration fails.
     output = Path(output)
-    for filename in ("report.json", "report.txt"):
-        (output / filename).unlink(missing_ok=True)
+    _invalidate_report_outputs(output)
     modules, targets, manifest = load_selection(config_path, target_name, module_names, function_name)
     if file_filter:
         modules = [m for m in modules if file_filter in m["name"]
@@ -363,18 +377,26 @@ def byte_metrics(original, rebuilt):
 
 def compare_windows(label, address, original, raw, relocated):
     """All bytes participate in equality; the independent mnemonic score has no gate."""
+    from binary_comp.core.disasm import disassemble_raw
+
+    return _compare_decoded_windows(
+        label, address, original, raw, relocated,
+        disassemble_raw(relocated, address, bits=32),
+        disassemble_raw(original, address, bits=32),
+        {"rebuilt": len(relocated), "original": len(original)})
+
+
+def _compare_decoded_windows(label, address, original, raw, relocated,
+                             rebuilt_instructions, original_instructions, required_bytes):
+    """Format full byte metrics independently of explicitly decoded instructions."""
     from binary_comp.analyzers.function_compare import (
         DisassemblyResult, FunctionComparison, format_comparison,
         instruction_mnemonics, mnemonic_similarity,
     )
     from binary_comp.core.binary import compare_binary, format_binary_comparison
-    from binary_comp.core.disasm import disassemble_raw
-
-    rebuilt_instructions = disassemble_raw(relocated, address, bits=32)
-    original_instructions = disassemble_raw(original, address, bits=32)
     decoded = {"rebuilt": sum(i.size for i in rebuilt_instructions),
                "original": sum(i.size for i in original_instructions)}
-    complete = decoded == {"rebuilt": len(relocated), "original": len(original)}
+    complete = decoded == required_bytes
     similarity = mnemonic_similarity(instruction_mnemonics(rebuilt_instructions),
                                      instruction_mnemonics(original_instructions)) if complete else None
     result = {"raw_bytes": byte_metrics(original, raw),
@@ -396,6 +418,24 @@ def compare_windows(label, address, original, raw, relocated):
         review.append(result["metric_error"])
     review.append("Mnemonic similarity ignores operands and encodings; it does not establish equality.")
     return result, "\n\n".join(review) + "\n"
+
+
+def compare_vector_windows(label, address, original, raw, relocated, context, name):
+    """Decode only native-validated vectors' complement; compare every byte."""
+    decoded, vectors = context.decode_vectors(name, original, relocated)
+    embedded = sum(vector["size"] for vector in vectors)
+    instruction_bytes = len(original) - embedded
+    metrics, review = _compare_decoded_windows(
+        label, address, original, raw, relocated, decoded["rebuilt"], decoded["original"],
+        {"rebuilt": instruction_bytes, "original": instruction_bytes})
+    metrics.update(inline_vectors=vectors, instruction_bytes=instruction_bytes,
+                   embedded_data_bytes=embedded)
+    lines = [f"Complete region: {len(original)} bytes; {instruction_bytes} instruction bytes; "
+             f"{embedded} embedded vector bytes. All bytes/fixups participate in equality."]
+    lines += [f"Native vector {vector['symbol']} at {address + vector['offset']:#x}: "
+              f"{vector['size']} bytes; {vector['checked_fixups']} checked DIR32 fixups."
+              for vector in vectors]
+    return metrics, "\n".join(lines) + "\n\n" + review
 
 
 def diagnostic_bytes(coff, section, function, version, bindings, reference, *,
@@ -641,8 +681,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     reference_hashes = {}
     output.mkdir(parents=True, exist_ok=True)
     # A failed compilation/reference check must not leave an old green summary.
-    for filename in ("report.json", "report.txt"):
-        (output / filename).unlink(missing_ok=True)
+    _invalidate_report_outputs(output)
     module_inputs = manifest_hashes(manifest_path, modules)
     validate_counted_code(modules, versions)
     for version in versions:
@@ -717,8 +756,13 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                         window = code_window(coff, section, int(target["va"], 16), len(original),
                                              bindings, reference,
                                              common_definitions=common_definitions, code_regions=code_regions)
-                    metrics, review = compare_windows(function["label"], int(target["va"], 16),
-                                                      original, window["data"], rebuilt)
+                    if kind == "region" and "inline_vectors" in function:
+                        metrics, review = compare_vector_windows(
+                            function["label"], int(target["va"], 16), original, window["data"],
+                            rebuilt, code_regions, function["symbol"])
+                    else:
+                        metrics, review = compare_windows(function["label"], int(target["va"], 16),
+                                                          original, window["data"], rebuilt)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_text(review)
                     row.update(metrics, checked_fixups=fixups,
@@ -803,6 +847,10 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                            f"mnemonics={score}")
             if "metric_error" in row:
                 details.append(row["metric_error"])
+            if "inline_vectors" in row:
+                details.append(f"complete region={row['body_size']} bytes; "
+                               f"instructions={row['instruction_bytes']}; "
+                               f"embedded vectors={row['embedded_data_bytes']}")
         if "diagnostic_error" in row:
             details.append("diagnostic unavailable: " + row["diagnostic_error"])
         detail = "; ".join(details)

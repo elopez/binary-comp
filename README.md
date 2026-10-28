@@ -498,8 +498,37 @@ all padding; no
 subsection selection or tail trimming is allowed. The original range must be
 executable and completely file-backed. Regions may not overlap any configured
 code or complete data window, and a native contribution may have only one owner
-across functions, labels and regions. Inline-table roles inside regions are
-currently rejected rather than inferred or carved out of the code bytes.
+across functions, labels and regions. Ordinary `inline_data` and byte-index table
+roles inside regions remain unsupported.
+
+A region can explicitly declare complete native relocation vectors interleaved
+with its instructions:
+
+```json
+"inline_vectors": [
+  {"symbol": "_dispatch_vector", "size": 8}
+]
+```
+
+This region-only field requires Capstone, including through the core comparison
+API. Each record must contain exactly `symbol` and `size`; sizes must be positive
+integer multiples of four. Each vector must be a four-byte-aligned native static,
+untyped symbol without auxiliary records in the same contribution. Its size must
+equal its complete native next-symbol/end extent, and its binding must give the
+exact address at the region origin plus its native offset, without another code
+or data role. Every slot must have one DIR32 relocation, a zero raw addend, and a
+native typed target explicitly declared in the region's exhaustive `entries`.
+Section symbols, weak fallbacks, foreign targets, overlapping vectors and entries
+inside vectors are rejected. No vectors are inferred from bytes or disassembly.
+
+The native core decodes every byte outside the declared vectors in both the
+original and relocated windows, including leading bytes, padding, unreachable
+instructions and bytes after internal returns. Every typed entry must start a
+decoded instruction. Incomplete decoding fails even when all bytes agree, and
+filtered code/data dependencies retain this validation. Vector bytes and all
+their fixups still participate in the complete region equality comparison.
+Without `inline_vectors`, existing region and ordinary function contracts are
+unchanged.
 
 Ordinary DIR32/REL32 fixups and complete data/COMMON checks apply unchanged.
 Defined typed or local-label targets in a region must preserve their exact
@@ -514,7 +543,12 @@ functions and compiler-label/function/zero-offset-alias gates remain strict.
 Reports use `kind: region` and separate region counts/byte totals, with entry
 addresses recorded as metadata. Entry names do not add function counts. Regions
 are not score targets; ordinary function scoring retains the same dependency
-checks. The core exposes `COFF.code_region()`, `compare_code_region()` and the
+checks. With `inline_vectors`, `body_size` and byte metrics still cover the complete
+region; `instruction_bytes`, `embedded_data_bytes` and `inline_vectors` record the
+explicit split, and `decoded_bytes` counts only instructions. Mnemonic similarity
+compares those instruction sequences. Vectors add no function or data rows, and
+`excluded_nop_padding` stays zero. The core exposes `COFF.code_region()`,
+`compare_code_region()` and the
 single-owner `CodeRegions` context accepted by code/data comparison APIs.
 `COFF.code_region(name, entries, *, anchor_offset=0)` applies the same explicit
 anchor contract in the core API; reports retain `anchor_offset` as region metadata.
