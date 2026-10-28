@@ -285,6 +285,52 @@ definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
 weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
 
+Ordinary initialized or BSS contributions can additionally require a coherent
+complete section layout. Put `section_layout: true` on exactly one complete
+member binding; the anchor may be an interior definition:
+
+```json
+"_first": {"va": "0x402004", "data_size": 4},
+"_second": {"va": "0x402008", "data_size": 8, "section_layout": true}
+```
+
+The exact boolean `true` enables this constraint; any other present value is an
+error. Every native runtime definition in the anchor's actual ordinary section,
+including unreferenced static definitions, needs an explicit full `data_size` or
+`data_hex` binding. Each binding's original address minus its native offset must
+give the same checked i386 section origin. All member roles, extents, bytes and
+fixups remain checked individually, then the entire section is compared using
+the native fixup engine. This includes unnamed leading bytes and all padding.
+The constraint adds no report rows, bytes or fixups to progress totals.
+
+This deliberately strict opt-in requires exactly one valid native section
+auxiliary record and distinct strong storage-2/3 ordinary definitions, without
+runtime auxiliaries or function types. Scalar and array types are supported.
+Co-located aliases, COMDAT, executable/code/removed/discardable sections,
+inline-data roles, COMMON anchors and provider-owned layouts are unsupported.
+Unflagged COMMON providers can coexist in their own namespace. The full original
+window must occupy one readable, non-executable, file-backed section, including
+for COFF BSS logical zeros; virtual-only tails are rejected. Core references
+supply trusted `read` and `section_for_va` metadata; the CLI uses strict
+`FileBackedPEImage` reads.
+
+Complete layout footprints cannot overlap other selected complete code, regions,
+data or layouts, including their unnamed prefixes and retained filtered function
+owners. Reusing one resolved object path/native section as two layout owners is
+also rejected. Entire modules excluded by selection remain outside this check.
+Every independent core comparison revalidates configured layouts, including
+unreferenced groups; there is no persistent successful-byte cache. Independent
+public calls from reference callbacks or later asynchronous tasks start fresh
+validation. Only native internal dispatches share a live matching operation.
+Acyclic data pointers work across members and groups; actual self/mutual data
+cycles retain the existing rejection.
+
+This validates supplied addresses, rather than discovering a unique placement.
+Uniformly moving an indistinguishable zero contribution can still pass a
+data-only comparison. An independently fixed incoming operand must establish
+its original root. The layout constraint does not establish linker order,
+translation-unit source boundaries or whole-executable equality.
+
 Data deliberately stored in an executable COFF contribution requires an explicit
 binding-level opt-in, for example:
 

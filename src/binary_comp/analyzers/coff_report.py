@@ -16,7 +16,8 @@ import re
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
                                    compare_function, executable_data_definitions, executable_data_size,
-                                   inline_table_alignment, is_function_type, validate_common_definitions,
+                                   inline_table_alignment, is_function_type, section_layout_definitions, section_layout_size,
+                                   validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
 
@@ -283,6 +284,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 inline_table_alignment(binding, symbol)
                 try:
                     executable_data_size(symbol, binding)
+                    section_layout_size(symbol, binding)
                 except ValueError as error:
                     raise ConfigError(str(error)) from error
             _code_bindings(bindings.get(target_name, {}),
@@ -471,6 +473,8 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     validate_native_role(coff, function["symbol"], "function")
     bindings = _code_bindings(module.get("bindings", {}).get(target_name, {}),
                               functions, target_name)
+    validate_section_layout_owners([(module, coff, bindings, common_definitions, object_path)],
+                                   target_name, reference)
     code_regions = region_context(coff, module, target_name, bindings, reference, common_definitions)
     validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
     try:
@@ -551,6 +555,46 @@ def validate_counted_code(modules, versions):
                     raise ValueError("Executable data overlaps configured code or data")
 
 
+def validate_section_layout_owners(records, version, reference):
+    """Check actual full native footprints against every retained selected owner.
+
+    Records contain parsed candidate objects; manifest anchor extents alone
+    cannot describe an unnamed prefix. This preflight adds no report rows.
+    """
+    layouts, windows, physical = [], [], set()
+    for module, coff, bindings, providers, path in records:
+        owners = section_layout_definitions(coff, bindings, reference,
+                                            common_definitions=providers)
+        for _, section, start, size, members in owners.values():
+            index = next(i for i, native in enumerate(coff.sections) if native is section)
+            identity = Path(path).resolve(), index
+            if identity in physical:
+                raise ValueError("Duplicate native section layout contribution ownership")
+            physical.add(identity)
+            layouts.append((start, start + size, module["name"], members))
+        for entry in ordinary_owners(module) + region_contracts(module):
+            if version in entry:
+                target = entry[version]
+                start = int(target["va"], 16)
+                windows.append((start, start + target["size"], module["name"], None))
+        for name, binding in bindings.items():
+            if "data_hex" in binding or "data_size" in binding:
+                size = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding
+                        else binding["data_size"])
+                start = int(binding["va"], 16)
+                windows.append((start, start + size, module["name"], name))
+    for index, layout in enumerate(layouts):
+        start, end, module, members = layout
+        for left, right, owner, name in windows:
+            if owner == module and name in members:
+                continue
+            if start < right and left < end:
+                raise ValueError("Section layout overlaps a selected complete code or data owner")
+        for other in layouts[index + 1:]:
+            if start < other[1] and other[0] < end:
+                raise ValueError("Overlapping complete section layouts")
+
+
 def validate_native_role(coff, symbol, kind):
     """Use native symbol records, never disassembly, to classify counted code."""
     try:
@@ -607,6 +651,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         target_config = targets[version]
         reference, actual_hash = load_reference(target_config, version)
         reference_hashes[version] = actual_hash
+        prepared = []
         for module in modules:
             entries = [(kind, f) for key, kind in CODE_ROLES
                        for f in module.get(key, []) if version in f]
@@ -615,12 +660,19 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 continue
             coff = load_object(module, target_config)
             common_definitions, hashes = load_common_definitions(module, target_config, version)
+            bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
+                                      ordinary_entries(module), version)
+            prepared.append((module, entries, coff, common_definitions, hashes, bindings))
+        validate_section_layout_owners([
+            (module, coff, bindings, providers,
+             object_path(target_config, module["name"] + ".obj")
+             if any("section_layout" in binding for binding in bindings.values()) else None)
+            for module, _, coff, providers, _, bindings in prepared], version, reference)
+        for module, entries, coff, common_definitions, hashes, bindings in prepared:
             provider_hashes.update(hashes)
             for kind, function in entries:
                 validate_native_role(coff, function["symbol"], kind)
             object_hashes[f"{version}/{module['name']}"] = hashlib.sha256(coff.data).hexdigest()
-            bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
-                                      ordinary_entries(module), version)
             data_owners = executable_data_definitions(coff, bindings, reference,
                                                       common_definitions=common_definitions)
             for _, section, _, _ in data_owners.values():

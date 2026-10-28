@@ -8,6 +8,8 @@ Complete code regions and explicit executable data additionally require
 strictly file-backed reads. No compiler, linker, project layout or build command
 is assumed here.
 """
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from pathlib import Path
 from collections.abc import Mapping
@@ -506,7 +508,216 @@ def executable_data_definitions(coff, bindings, reference, *, common_definitions
     return owners
 
 
+def section_layout_size(name, binding):
+    """Validate the true-only ordinary contribution constraint, when present."""
+    if "section_layout" not in binding:
+        return None
+    if binding["section_layout"] is not True:
+        raise ValueError(f"section_layout must be true for {name}")
+    return _ordinary_layout_size(name, binding)
+
+
+def _ordinary_layout_size(name, binding):
+    if ({"size", "inline_data", "inline_index_for", "inline_alignment", "executable_data"}
+            & binding.keys() or ("data_size" in binding) == ("data_hex" in binding)):
+        raise ValueError(f"Section layout needs one complete ordinary data extent: {name}")
+    try:
+        size = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding
+                else binding["data_size"])
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Invalid section layout extent: {name}") from error
+    if type(size) is not int or size <= 0:
+        raise ValueError(f"Invalid section layout extent: {name}")
+    return size
+
+
+def section_layout_definitions(coff, bindings, reference, *, common_definitions=None):
+    """Discover complete ordinary contribution layouts without scoring bytes.
+
+    This uses actual native records, including unnamed and auxiliary records.
+    Provider mappings have a separate namespace and cannot own this opt-in.
+    Returned ranges add constraints, never additional counted definitions.
+    """
+    owners = {}
+    provider = (isinstance(common_definitions, Mapping)
+                and any(coff is item for item in common_definitions.values()))
+    for name, binding in bindings.items():
+        if section_layout_size(name, binding) is None:
+            continue
+        if provider:
+            if name in coff.named and coff.named[name]["section"] > 0:
+                raise ValueError("Provider-owned section layouts are unsupported")
+            continue
+        try:
+            anchor, section = coff.definition(name)
+        except (KeyError, ValueError) as error:
+            raise ValueError(f"Section layout needs an ordinary native definition: {name}") from error
+        flags = section["flags"]
+        if (not section["data"] or bool(flags & 0x40) == bool(flags & 0x80)
+                or flags & (0x20 | 0x20000000 | 0x1000 | 0x200 | 0x800 | 0x02000000)):
+            raise ValueError(f"Section layout needs ordinary initialized or BSS storage: {name}")
+        if id(section) in owners:
+            raise ValueError("Duplicate section layout anchor")
+        members, offsets, origins = {}, set(), set()
+        metadata = 0
+        for symbol in coff.symbols.values():
+            if symbol["section"] != anchor["section"]:
+                continue
+            if _is_section_definition(coff, symbol, section):
+                metadata += 1
+                continue
+            member = symbol["name"]
+            if (symbol["storage"] not in (2, 3) or symbol["aux_count"]
+                    or is_function_type(symbol["type"]) or not member or member in members
+                    or not 0 <= symbol["value"] < len(section["data"])
+                    or symbol["value"] in offsets or coff.named.get(member) is not symbol):
+                raise ValueError(f"Unsupported native section layout definition: {member}")
+            if member not in bindings:
+                raise ValueError(f"Section layout needs an explicit complete binding: {member}")
+            extent = _ordinary_layout_size(member, bindings[member])
+            if extent != coff.definition_extent(member):
+                raise ValueError(f"Section layout extent differs from complete definition: {member}")
+            origins.add(_binding_address(bindings[member]["va"], member) - symbol["value"])
+            offsets.add(symbol["value"])
+            members[member] = extent
+        if metadata != 1 or name not in members:
+            raise ValueError("Section layout needs exactly one valid native section auxiliary record")
+        if len(origins) != 1:
+            raise ValueError("Section layout definitions disagree on original origin")
+        origin = origins.pop()
+        size = len(section["data"])
+        if not 0 <= origin < origin + size <= 0x100000000:
+            raise ValueError("Section layout range outside i386 address domain")
+        if not callable(getattr(reference, "section_for_va", None)):
+            raise ValueError("Section layouts require original section metadata")
+        backing = reference.section_for_va(origin)
+        if (backing is None or not backing.flags & 0x40000000
+                or backing.flags & (0x20 | 0x20000000) or origin < backing.start
+                or origin + size > backing.end or origin + size > backing.start + backing.rawsize):
+            raise ValueError("Section layout original range must be readable ordinary file-backed storage")
+        original = reference.read(origin, size)
+        if not isinstance(original, (bytes, bytearray)) or len(original) != size:
+            raise ValueError("Truncated original section layout")
+        for other, other_binding in bindings.items():
+            if other in members:
+                continue
+            length = (len(bytes.fromhex(other_binding["data_hex"])) if "data_hex" in other_binding
+                      else other_binding.get("data_size", other_binding.get("size")))
+            if length is None:
+                continue
+            start = _binding_address(other_binding["va"], other)
+            if type(length) is not int or length <= 0 or start + length > 0x100000000:
+                raise ValueError(f"Invalid complete COFF owner range: {other}")
+            if origin < start + length and start < origin + size:
+                raise ValueError(f"Section layout overlaps configured code or data: {name}, {other}")
+        owners[id(section)] = (name, section, origin, size, frozenset(members))
+    return owners
+
+
+def _layout_code_window(coff, bindings, reference, origin, size, common_definitions=None):
+    for _, _, start, length, _ in section_layout_definitions(
+            coff, bindings, reference, common_definitions=common_definitions).values():
+        if origin < start + length and start < origin + size:
+            raise ValueError("Code window overlaps a complete section layout")
+
+
+class _LayoutOperation:
+    """One live native comparison context, never a successful-byte cache."""
+
+    def __init__(self, coff, bindings, reference, providers, regions):
+        self.coff = coff
+        self.bindings = deepcopy(bindings)
+        self.reference = reference
+        self.providers = dict(providers) if isinstance(providers, Mapping) else providers
+        self.regions = regions
+        self.active = True
+
+    def matches(self, coff, bindings, reference, providers, regions):
+        if (not self.active or coff is not self.coff or reference is not self.reference
+                or bindings != self.bindings or regions is not self.regions):
+            return False
+        if self.providers is None:
+            return providers is None
+        return (isinstance(self.providers, Mapping) and isinstance(providers, Mapping)
+                and self.providers.keys() == providers.keys()
+                and all(providers[name] is value for name, value in self.providers.items()))
+
+
+class _LayoutDispatch:
+    """Single-use permission for a native internal call, consumed before reads."""
+
+    def __init__(self, operation):
+        self.operation = operation
+        self.consumed = False
+
+
+_layout_operation = ContextVar("coff_section_layout_operation", default=None)
+_layout_dispatch = ContextVar("coff_section_layout_dispatch", default=None)
+
+
+def _layout_call(function, *args, **kwargs):
+    """Mark only a native internal dispatch as eligible to share scheduling."""
+    dispatch = _LayoutDispatch(_layout_operation.get())
+    token = _layout_dispatch.set(dispatch)
+    try:
+        return function(*args, **kwargs)
+    finally:
+        # Copied contexts retain this object, so invalidate it before reset too.
+        dispatch.consumed = True
+        _layout_dispatch.reset(token)
+
+
+@contextmanager
+def _validate_section_layouts(coff, bindings, reference, common_definitions=None, code_regions=None):
+    # Consume the private dispatch before metadata can call the reference.
+    # Public callback entries, even with identical inputs, receive no permit.
+    dispatch = _layout_dispatch.get()
+    previous = None
+    if dispatch is not None and not dispatch.consumed:
+        dispatch.consumed = True
+        previous = dispatch.operation
+    owners = section_layout_definitions(coff, bindings, reference,
+                                        common_definitions=common_definitions)
+    if (previous is not None and previous is _layout_operation.get()
+            and previous.matches(coff, bindings, reference, common_definitions, code_regions)):
+        yield
+        return
+    if code_regions is not None:
+        code_regions.check_context(coff, bindings, reference, common_definitions)
+        for region in code_regions.regions.values():
+            target = region[code_regions.version]
+            _layout_code_window(coff, bindings, reference,
+                                _binding_address(target["va"], region["symbol"]), target["size"],
+                                common_definitions)
+    operation = _LayoutOperation(coff, bindings, reference, common_definitions, code_regions)
+    token = _layout_operation.set(operation)
+    try:
+        # Each member and contribution starts an independent pointer path.
+        # Nested fixups must not eagerly restart unrelated groups on that path.
+        for _, section, origin, size, members in owners.values():
+            for member in sorted(members):
+                _layout_call(validate_data_binding, coff, member, bindings, reference, set(),
+                    common_definitions=common_definitions, code_regions=code_regions)
+            actual, _ = _layout_call(apply_fixups, coff, section["data"], section["relocations"], origin,
+                bindings, reference, set(), common_definitions=common_definitions,
+                code_regions=code_regions)
+            if not compare_binary(reference.read(origin, size), actual).exact:
+                raise ValueError("Rebuilt complete section layout differs from original")
+        yield
+    finally:
+        operation.active = False
+        _layout_operation.reset(token)
+
+
 def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None,
+                 *, common_definitions=None, code_regions=None):
+    """Apply every native fixup after complete configured layout validation."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting,
+                             common_definitions=common_definitions, code_regions=code_regions)
+
+
+def _apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=None,
                  *, common_definitions=None, code_regions=None):
     _checked_origin(origin)
     data_owners = executable_data_definitions(coff, bindings, reference,
@@ -514,7 +725,8 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
     if visiting is None:
-        validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
+        _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
+            code_regions=code_regions)
     body = bytearray(raw)
     occupied = set()
     for offset, index, kind in relocations:
@@ -539,14 +751,14 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
             elif _needs_executable_data_owner(coff, symbol, section):
                 raise ValueError(f"Untyped executable data target needs complete explicit validation: {name}")
             elif code_regions is not None:
-                code_regions.validate_target(coff, symbol, address, visiting)
+                _layout_call(code_regions.validate_target, coff, symbol, address, visiting)
             else:
                 _validate_function_alias_bindings(
                     coff, coff.sections[symbol["section"] - 1],
                     address if is_function_type(symbol["type"]) else address - symbol["value"], bindings)
         if "data_hex" in binding or "data_size" in binding:
-            validate_data_binding(coff, name, bindings, reference, visiting,
-                                  common_definitions=common_definitions, code_regions=code_regions)
+            _layout_call(validate_data_binding, coff, name, bindings, reference, visiting,
+                common_definitions=common_definitions, code_regions=code_regions)
         elif (_is_common_symbol(symbol) or (symbol["section"] != 0 and
               not coff.sections[symbol["section"] - 1]["flags"] & 0x20)):
             raise ValueError(f"Defined data symbol needs complete data validation: {name}")
@@ -562,6 +774,13 @@ def apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=N
 
 
 def validate_common_definitions(coff, bindings, reference, common_definitions=None, *, code_regions=None):
+    """Validate explicit COMMON providers and complete configured layouts."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _validate_common_definitions(coff, bindings, reference, common_definitions,
+                                            code_regions=code_regions)
+
+
+def _validate_common_definitions(coff, bindings, reference, common_definitions=None, *, code_regions=None):
     """Eagerly validate explicit same-size strong providers for native COMMONs.
 
     Providers are already parsed objects. No file lookup, symbol search or
@@ -600,18 +819,27 @@ def validate_common_definitions(coff, bindings, reference, common_definitions=No
     # A configured but unreferenced mapping must not hide wrong provider bytes,
     # missing dependencies, a bare address or an invalid contribution extent.
     for name in common_definitions:
-        validate_data_binding(coff, name, bindings, reference, set(),
-                              common_definitions=common_definitions, code_regions=code_regions)
+        _layout_call(validate_data_binding, coff, name, bindings, reference, set(),
+            common_definitions=common_definitions, code_regions=code_regions)
 
 
 def validate_data_binding(coff, name, bindings, reference, visiting=None,
+                          *, common_definitions=None, code_regions=None):
+    """Compare a complete data definition and all configured section layouts."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _validate_data_binding(coff, name, bindings, reference, visiting,
+                                      common_definitions=common_definitions, code_regions=code_regions)
+
+
+def _validate_data_binding(coff, name, bindings, reference, visiting=None,
                           *, common_definitions=None, code_regions=None):
     """Compare a complete data definition, including all checked pointer fixups."""
     executable_data_definitions(coff, bindings, reference, common_definitions=common_definitions)
     if code_regions is not None:
         code_regions.check_context(coff, bindings, reference, common_definitions)
     if visiting is None:
-        validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
+        _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
+            code_regions=code_regions)
         visiting = set()
     identity = id(coff), name
     if identity in visiting:
@@ -640,9 +868,9 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None,
         if common_definitions is not None and name in common_definitions:
             visiting.add(identity)
             try:
-                return validate_data_binding(common_definitions[name], name, bindings,
-                                             reference, visiting,
-                                             common_definitions=common_definitions, code_regions=code_regions)
+                return _layout_call(validate_data_binding, common_definitions[name], name, bindings,
+                    reference, visiting,
+                    common_definitions=common_definitions, code_regions=code_regions)
             finally:
                 visiting.remove(identity)
     if "data_hex" in binding:
@@ -679,8 +907,8 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None,
                     or _binding_address(target_binding["va"], target["name"]) != origin + target["value"]):
                 raise ValueError(f"Inline case target differs from native code offset: {target['name']}")
         if "inline_index_for" in binding:
-            validate_data_binding(coff, binding["inline_index_for"], bindings, reference,
-                                  visiting | {identity}, common_definitions=common_definitions, code_regions=code_regions)
+            _layout_call(validate_data_binding, coff, binding["inline_index_for"], bindings, reference,
+                visiting | {identity}, common_definitions=common_definitions, code_regions=code_regions)
     elif ("executable_data" not in binding
           and (is_function_type(definition["type"]) or section["flags"] & 0x20)):
         raise ValueError(f"Expected a data definition for {name}")
@@ -698,8 +926,8 @@ def validate_data_binding(coff, name, bindings, reference, visiting=None,
                    if offset < end and offset + 4 > start]
     visiting.add(identity)
     try:
-        actual, fixups = apply_fixups(coff, raw, relocations, address, bindings, reference,
-                                     visiting, common_definitions=common_definitions, code_regions=code_regions)
+        actual, fixups = _layout_call(apply_fixups, coff, raw, relocations, address, bindings, reference,
+            visiting, common_definitions=common_definitions, code_regions=code_regions)
     finally:
         visiting.remove(identity)
     if not compare_binary(expected, actual).exact:
@@ -749,13 +977,23 @@ def inline_table(coff, name, bindings):
 
 def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=False,
                 common_definitions=None, code_regions=None):
+    """Bound strict code/inline data and reject complete layout overlaps."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _code_window(coff, section, origin, size, bindings, reference, diagnostic=diagnostic,
+                            common_definitions=common_definitions, code_regions=code_regions)
+
+
+def _code_window(coff, section, origin, size, bindings, reference, *, diagnostic=False,
+                common_definitions=None, code_regions=None):
     """Bound code and native inline data once for both the gate and reviews."""
     _checked_origin(origin)
+    _layout_code_window(coff, bindings, reference, origin, size, common_definitions)
     for _, owned_section, address, length in executable_data_definitions(
             coff, bindings, reference, common_definitions=common_definitions).values():
         if section is owned_section or (origin < address + length and address < origin + size):
             raise ValueError("Code window overlaps a complete executable data contribution")
-    validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
+    _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
+        code_regions=code_regions)
     if code_regions is not None:
         code_regions.validate_code_window(section, origin, size)
     _validate_function_alias_bindings(coff, section, origin, bindings)
@@ -794,8 +1032,8 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
                     or reference.read(origin + size, len(gap)) != gap):
                 raise BodyExtentError("Non-NOP or changed alignment before inline table")
         for name, _ in tables:
-            validate_data_binding(coff, name, mapping, reference,
-                                  common_definitions=common_definitions, code_regions=table_regions)
+            _layout_call(validate_data_binding, coff, name, mapping, reference,
+                common_definitions=common_definitions, code_regions=table_regions)
         end = start if diagnostic else size
         relocations = [(offset, index, kind) for offset, index, kind in section["relocations"]
                        if offset < start]
@@ -820,20 +1058,36 @@ def code_window(coff, section, origin, size, bindings, reference, *, diagnostic=
 
 
 def relocate(coff, section, origin, size, bindings, reference, *, common_definitions=None, code_regions=None):
-    window = code_window(coff, section, origin, size, bindings, reference,
+    """Relocate a complete code window in a fresh public comparison operation."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _relocate(coff, section, origin, size, bindings, reference,
                          common_definitions=common_definitions, code_regions=code_regions)
-    return apply_fixups(coff, window["data"], window["relocations"], origin,
-                        window["bindings"], reference, common_definitions=common_definitions,
-                        code_regions=window.get("code_regions", code_regions))
 
 
-def compare_function(coff, function, version, bindings, reference, *, common_definitions=None, code_regions=None):
-    validate_common_definitions(coff, bindings, reference, common_definitions, code_regions=code_regions)
+def _relocate(coff, section, origin, size, bindings, reference, *, common_definitions=None, code_regions=None):
+    window = _layout_call(code_window, coff, section, origin, size, bindings, reference,
+        common_definitions=common_definitions, code_regions=code_regions)
+    return _layout_call(apply_fixups, coff, window["data"], window["relocations"], origin,
+        window["bindings"], reference, common_definitions=common_definitions,
+        code_regions=window.get("code_regions", code_regions))
+
+
+def compare_function(coff, function, version, bindings, reference, *,
+                     common_definitions=None, code_regions=None):
+    """Compare one complete native function with checked data constraints."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _compare_function(coff, function, version, bindings, reference,
+                                 common_definitions=common_definitions, code_regions=code_regions)
+
+
+def _compare_function(coff, function, version, bindings, reference, *, common_definitions=None, code_regions=None):
+    _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
+        code_regions=code_regions)
     target = function[version]
     address, size = _binding_address(target["va"], function["symbol"]), target["size"]
     section = coff.function(function["symbol"])
-    actual, relocations = relocate(coff, section, address, size, bindings, reference,
-                                   common_definitions=common_definitions, code_regions=code_regions)
+    actual, relocations = _layout_call(relocate, coff, section, address, size, bindings, reference,
+        common_definitions=common_definitions, code_regions=code_regions)
     expected = reference.read(address, size)
     return compare_binary(expected, actual).exact, actual, expected, relocations
 
@@ -857,6 +1111,7 @@ class CodeRegions:
         for name, binding in self.bindings.items():
             inline_table_alignment(binding, name)
         executable_data_definitions(coff, bindings, reference, common_definitions=common_definitions)
+        section_layout_definitions(coff, bindings, reference, common_definitions=common_definitions)
         self.regions = {}
         self.sections = {}
         for region in regions:
@@ -920,6 +1175,7 @@ class CodeRegions:
             raise ValueError("Invalid complete code region range")
         if size != len(section["data"]):
             raise ValueError("Code region size differs from complete COFF contribution")
+        _layout_code_window(self.coff, self.bindings, self.reference, origin, size, self.common_definitions)
         for other in self.regions.values():
             if other["symbol"] == region["symbol"]:
                 continue
@@ -955,6 +1211,11 @@ class CodeRegions:
         return section
 
     def compare(self, name, visiting=None):
+        with _validate_section_layouts(self.coff, self.bindings, self.reference,
+                                       self.common_definitions, self):
+            return self._compare(name, visiting)
+
+    def _compare(self, name, visiting=None):
         region = self.regions[name]
         section = self._metadata(region)
         if self.sections.get(id(section)) is not region:
@@ -966,7 +1227,7 @@ class CodeRegions:
             raise ValueError("Recursive code region comparison")
         visiting.add(identity)
         try:
-            actual, fixups = apply_fixups(
+            actual, fixups = _layout_call(apply_fixups,
                 self.coff, section["data"], section["relocations"], origin,
                 self.bindings, self.reference, visiting,
                 common_definitions=self.common_definitions, code_regions=self)
@@ -976,6 +1237,11 @@ class CodeRegions:
         return compare_binary(expected, actual).exact, actual, expected, fixups
 
     def validate_target(self, coff, symbol, address, visiting):
+        with _validate_section_layouts(coff, self.bindings, self.reference,
+                                       self.common_definitions, self):
+            return self._validate_target(coff, symbol, address, visiting)
+
+    def _validate_target(self, coff, symbol, address, visiting):
         section = coff.sections[symbol["section"] - 1]
         if coff is not self.coff:
             if any(s["value"] != 0 for s in coff._section_functions(section)):
@@ -997,11 +1263,19 @@ class CodeRegions:
             raise ValueError("Code region target differs from its native offset")
         identity = ("code region", id(coff), id(section))
         if visiting is None or identity not in visiting:
-            if not self.compare(region["symbol"], visiting)[0]:
+            if not _layout_call(self.compare, region["symbol"], visiting)[0]:
                 raise ValueError("Referenced complete code region differs from original")
 
 
 def compare_code_region(coff, region, version, bindings, reference, *,
+                        common_definitions=None, code_regions=None):
+    """Compare one complete multi-entry contribution with checked data constraints."""
+    with _validate_section_layouts(coff, bindings, reference, common_definitions, code_regions):
+        return _compare_code_region(coff, region, version, bindings, reference,
+                                    common_definitions=common_definitions, code_regions=code_regions)
+
+
+def _compare_code_region(coff, region, version, bindings, reference, *,
                         common_definitions=None, code_regions=None):
     """Compare one complete multi-entry section without a function-body claim."""
     if code_regions is None:
@@ -1011,12 +1285,12 @@ def compare_code_region(coff, region, version, bindings, reference, *,
     if (code_regions.coff is not coff or code_regions.version != version
             or code_regions.regions.get(region["symbol"]) != region):
         raise ValueError("Code region context differs from its COFF owner")
-    validate_common_definitions(coff, bindings, reference, common_definitions,
-                                code_regions=code_regions)
-    result = code_regions.compare(region["symbol"])
+    _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
+        code_regions=code_regions)
+    result = _layout_call(code_regions.compare, region["symbol"])
     if result[0]:
         for name, binding in bindings.items():
             if "data_size" in binding or "data_hex" in binding:
-                validate_data_binding(coff, name, bindings, reference,
-                                      common_definitions=common_definitions, code_regions=code_regions)
+                _layout_call(validate_data_binding, coff, name, bindings, reference,
+                    common_definitions=common_definitions, code_regions=code_regions)
     return result
