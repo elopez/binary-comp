@@ -471,13 +471,18 @@ def diagnostic_window(coff, section, function, version, bindings, reference, *,
     raw = window["data"]
     metrics, review = compare_windows(function["label"], address, original, raw, rebuilt)
     inline = "inline_data_bytes" in window
+    owner, _, _ = coff.function_owner(section)
+    ordinary = owner is not section
     description = ("complete COFF code prefix before validated inline data" if inline
+                   else "complete ordinary COFF function window" if ordinary
                    else "complete COFF function section")
     note = (f"Diagnostic only: {description} ({len(raw)} bytes), "
             f"including any compiler padding before native data, versus bounded original body ({size} bytes). "
             "The strict matcher rejected this extent; these metrics do not accept it.")
     metrics.update(diagnostic_only=True,
-                   comparison_window="coff_code_before_inline_data" if inline else "complete_coff_function_section",
+                   comparison_window=("coff_code_before_inline_data" if inline
+                                      else "complete_coff_function_window" if ordinary
+                                      else "complete_coff_function_section"),
                    coff_window_size=len(raw), checked_fixups=fixups)
     if inline:
         metrics.update(inline_data_bytes=window["inline_data_bytes"],
@@ -750,6 +755,10 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                                           for entry in function["entries"]]
                     else:
                         section = coff.function(function["symbol"])
+                        owner, start, end = coff.function_owner(section)
+                        if owner is not section:
+                            row.update(native_function_offset=start, native_function_end=end,
+                                       native_section_size=len(owner["data"]))
                         _, rebuilt, original, fixups = compare_function(
                             coff, function, version, bindings, reference,
                             common_definitions=common_definitions, code_regions=code_regions)
@@ -840,7 +849,9 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             similarity = row["mnemonic_similarity"]
             score = f"{similarity:.2f}%" if similarity is not None else "unavailable"
             if row.get("diagnostic_only"):
-                extent = "code prefix before inline data" if "inline_data_bytes" in row else "complete COFF section"
+                extent = ("code prefix before inline data" if "inline_data_bytes" in row
+                          else "complete ordinary function window" if "native_function_offset" in row
+                          else "complete COFF section")
                 details.append(f"diagnostic {extent}={row['coff_window_size']} bytes "
                                "(any compiler padding included)")
             details.append(f"raw={row['raw_bytes']['exact']} relocated={row['relocated_bytes']['exact']} "

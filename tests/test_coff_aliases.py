@@ -16,13 +16,15 @@ from test_coff_score import score_arguments
 
 
 def aliased_bytes(names, *, offsets=(0, 0), code=None, value=7, self_references=False):
+    # This fixture models one indivisible COMDAT contribution, not an ordinary
+    # section containing separately bounded functions.
     code = bytes.fromhex("a1 00 00 00 00 c3") if code is None else code
     relocations = [(1, 2, 6)]
     if self_references:
         code = bytes.fromhex("a1 00 00 00 00 68 00 00 00 00 e8 00 00 00 00 c3")
         relocations += [(6, names.index("alias"), 6), (11, names.index("alias"), 0x14)]
     return coff_bytes([
-        {"data": code, "relocations": relocations},
+        {"data": code, "flags": 0x60001020, "relocations": relocations},
         {"name": ".data", "data": struct.pack("<I", value), "flags": DATA_FLAGS},
     ], [{"name": name, "section": 1, "value": offset, "type": 0x24}
         for name, offset in zip(names, offsets)] + [{"name": "number", "section": 2}])
@@ -46,7 +48,7 @@ def test_parser_rejects_distinct_entries_and_nonzero_alias_groups(offsets, selec
 
 @pytest.mark.parametrize("offset", [0, 1])
 def test_static_function_auxiliary_metadata_does_not_hide_an_entry(offset):
-    coff = COFF.from_bytes(coff_bytes([{"data": b"\xc3\x90"}], [
+    coff = COFF.from_bytes(coff_bytes([{"data": b"\xc3\x90", "flags": 0x60001020}], [
         {"name": "answer", "section": 1, "type": 0x20},
         {"name": "local_alias", "section": 1, "type": 0x24,
          "storage": 3, "aux": bytes(18), "value": offset},

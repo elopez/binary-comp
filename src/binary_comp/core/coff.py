@@ -57,6 +57,15 @@ def _is_ia32_alignment(data):
     return True
 
 
+class _FunctionSection(dict):
+    """A bounded view, retaining the native contribution for ownership checks."""
+
+    def __init__(self, coff, name, owner, start, end, relocations):
+        super().__init__(owner, data=owner["data"][start:end], relocations=relocations)
+        self.coff, self.name, self.owner = coff, name, owner
+        self.start, self.end = start, end
+
+
 class COFF:
     """MSVC i386 object, retaining original symbol indices for relocations."""
 
@@ -221,6 +230,53 @@ class COFF:
                 and self.sections[s["section"] - 1] is section
                 and is_function_type(s["type"])]
 
+    def _ordinary_function_bounds(self, section):
+        """Bound ordinary functions only by native typed entries, never labels."""
+        functions = self._section_functions(section)
+        if (not functions or not section["flags"] & 0x20 or section["flags"] & 0x1000
+                or not section["flags"] & 0x20000000
+                or min(s["value"] for s in functions) != 0):
+            raise ValueError("Nonzero function entries require ordinary executable code with a typed entry at section offset zero")
+        if any(s["storage"] not in (2, 3) or self.named.get(s["name"]) is not s
+               or type(s["value"]) is not int
+               or not 0 <= s["value"] < len(section["data"])
+               for s in functions):
+            raise ValueError("Invalid ordinary typed function entry")
+        starts = sorted({s["value"] for s in functions})
+        boundaries = dict(zip(starts, starts[1:] + [len(section["data"])]))
+        occupied = set()
+        for offset, _, _ in section["relocations"]:
+            if offset < 0 or offset + 4 > len(section["data"]):
+                raise ValueError("Relocation outside ordinary code section")
+            if occupied.intersection(range(offset, offset + 4)):
+                raise ValueError("Overlapping ordinary code relocations")
+            occupied.update(range(offset, offset + 4))
+            if any(offset < start < offset + 4 for start in starts):
+                raise ValueError("Relocation crosses a typed function boundary")
+        return boundaries
+
+    def _function_section(self, name, owner, start, end):
+        relocations = [(offset - start, index, kind)
+                       for offset, index, kind in owner["relocations"]
+                       if start <= offset < end]
+        return _FunctionSection(self, name, owner, start, end, relocations)
+
+    def function_owner(self, section):
+        """Return native ownership and recheck every bounded view on each use."""
+        if not isinstance(section, _FunctionSection):
+            return section, 0, len(section["data"])
+        if section.coff is not self:
+            raise ValueError("Function window belongs to a different COFF object")
+        symbol, owner = self.definition(section.name)
+        bounds = self._ordinary_function_bounds(owner)
+        start = symbol["value"]
+        end = bounds.get(start)
+        if (owner is not section.owner or start != section.start or end != section.end
+                or not is_function_type(symbol["type"])
+                or section != self._function_section(section.name, owner, start, end)):
+            raise ValueError("Function window differs from its current native owner")
+        return owner, start, end
+
     def code_region(self, name, entries, *, anchor_offset=0):
         """Select a complete multi-entry contribution from its native records."""
         anchor, section = self.definition(name)
@@ -267,16 +323,25 @@ class COFF:
         if type(size) is not int or size <= 0:
             raise ValueError(f"Invalid inline table size: {name}")
         functions = self._section_functions(section)
-        if len(functions) != 1 or functions[0]["value"] != 0:
-            raise ValueError("Inline data requires one /Gy function per section")
+        owner_start, owner_end = 0, len(section["data"])
+        if any(s["value"] != 0 for s in functions):
+            bounds = self._ordinary_function_bounds(section)
+            preceding = [start for start in bounds if start < symbol["value"]]
+            if not preceding:
+                raise ValueError("Inline data needs a preceding typed function owner")
+            owner_start = max(preceding)
+            owner_end = bounds[owner_start]
+            functions = [s for s in functions if s["value"] == owner_start]
+        if len(functions) != 1 or functions[0]["value"] != owner_start:
+            raise ValueError("Inline data requires one /Gy function per section or one ordinary typed owner")
         start, end = symbol["value"], symbol["value"] + size
         boundary = start + self.definition_extent(name)
-        if not 0 < start < end <= boundary <= len(section["data"]):
+        if not owner_start < start < end <= boundary <= owner_end:
             raise ValueError(f"Invalid inline table extent: {name}")
         # A following native symbol can bound four-byte table alignment. The
         # final definition can extend only to its next 16-byte boundary.
         tail = section["data"][end:boundary]
-        if (boundary != len(section["data"]) and tail
+        if (boundary != owner_end and tail
                 and boundary != (end + 3) // 4 * 4):
             raise ValueError(f"Excessive or unaligned inline table padding: {name}")
         if boundary > (end + 15) // 16 * 16 or not _is_ia32_alignment(tail):
@@ -298,7 +363,8 @@ class COFF:
             for offset, index, _ in relocations:
                 target = self.resolve_symbol(index)
                 if (target["section"] != symbol["section"] or target["storage"] != 6
-                        or is_function_type(target["type"]) or not 0 <= target["value"] < start):
+                        or is_function_type(target["type"])
+                        or not owner_start <= target["value"] < start):
                     raise ValueError(f"Inline table target is not a local case label: {name}")
                 if u32(section["data"], start + offset):
                     raise ValueError(f"Inline case-pointer addend must be zero: {name}")
@@ -308,18 +374,24 @@ class COFF:
         if any(end <= offset < boundary for offset, _, _ in section["relocations"]):
             raise ValueError(f"Relocation in inline table padding: {name}")
         return {"symbol": symbol, "owner": functions[0], "section": section,
+                "owner_start": owner_start, "owner_end": owner_end,
                 "start": start, "end": end, "data": section["data"][start:end],
                 "relocations": relocations, "alignment_padding": tail,
                 "trailing_nop_padding": tail.count(b"\x90")}
 
     def function(self, name):
+        """Select a complete function contribution or a checked ordinary window."""
         symbol, section = self.definition(name)
         if not section["flags"] & 0x20:
             raise ValueError(f"Not a code symbol: {name}")
         if is_function_type(symbol["type"]):
             functions = self._section_functions(section)
             if any(s["value"] != 0 for s in functions):
-                raise ValueError("Comparison requires all /Gy function entries at section offset zero")
+                bounds = self._ordinary_function_bounds(section)
+                start = symbol["value"]
+                if start not in bounds:
+                    raise ValueError(f"Invalid ordinary function definition: {name}")
+                return self._function_section(name, section, start, bounds[start])
             return section
         # VC6 emits EH cleanup/handler entries as labels in a shared .text$x
         # section. Bound each complete entry by the next symbol or section end.
@@ -359,10 +431,21 @@ def _binding_address(value, name):
 
 
 def _validate_function_alias_bindings(coff, section, origin, bindings):
-    """Co-located entry names cannot acquire different configured origins."""
+    """Keep aliases and ordinary same-section symbols at their native offsets."""
+    section, offset, _ = coff.function_owner(section)
     functions = coff._section_functions(section)
     if any(s["value"] != 0 for s in functions):
-        raise ValueError("Comparison requires all /Gy function entries at section offset zero")
+        coff._ordinary_function_bounds(section)
+        base = _checked_origin(origin - offset)
+        if base + len(section["data"]) > 0x100000000:
+            raise ValueError("Ordinary code section outside i386 address domain")
+        for symbol in coff.symbols.values():
+            name = symbol["name"]
+            if (name in bindings and 1 <= symbol["section"] <= len(coff.sections)
+                    and coff.sections[symbol["section"] - 1] is section
+                    and _binding_address(bindings[name]["va"], name) != base + symbol["value"]):
+                raise ValueError(f"Ordinary same-section binding differs from native offset: {name}")
+        return
     if len(functions) <= 1:
         return
     for symbol in functions:
@@ -759,7 +842,7 @@ def _apply_fixups(coff, raw, relocations, origin, bindings, reference, visiting=
             else:
                 _validate_function_alias_bindings(
                     coff, coff.sections[symbol["section"] - 1],
-                    address if is_function_type(symbol["type"]) else address - symbol["value"], bindings)
+                    address - symbol["value"], bindings)
         if "data_hex" in binding or "data_size" in binding:
             _layout_call(validate_data_binding, coff, name, bindings, reference, visiting,
                 common_definitions=common_definitions, code_regions=code_regions)
@@ -897,7 +980,10 @@ def _validate_data_binding(coff, name, bindings, reference, visiting=None,
         if "va" not in owner or type(owner.get("size")) is not int or owner["size"] <= 0:
             raise ValueError(f"Inline table needs its configured function extent: {name}")
         origin = _binding_address(owner["va"], table["owner"]["name"])
-        if address != origin + table["start"]:
+        _validate_function_alias_bindings(
+            coff, coff.function(table["owner"]["name"]), origin, bindings)
+        owner_start = table["owner_start"]
+        if address != origin + table["start"] - owner_start:
             raise ValueError(f"Inline table address differs from native code offset: {name}")
         padding = table["alignment_padding"]
         if padding and reference.read(address + size, len(padding)) != padding:
@@ -907,8 +993,9 @@ def _validate_data_binding(coff, name, bindings, reference, visiting=None,
             target_binding = bindings.get(target["name"])
             if target_binding is None:
                 raise ValueError(f"Unresolved relocation: {target['name']}")
-            if (target["value"] >= owner["size"]
-                    or _binding_address(target_binding["va"], target["name"]) != origin + target["value"]):
+            if (not owner_start <= target["value"] < owner_start + owner["size"]
+                    or _binding_address(target_binding["va"], target["name"])
+                    != origin + target["value"] - owner_start):
                 raise ValueError(f"Inline case target differs from native code offset: {target['name']}")
         if "inline_index_for" in binding:
             _layout_call(validate_data_binding, coff, binding["inline_index_for"], bindings, reference,
@@ -991,10 +1078,11 @@ def _code_window(coff, section, origin, size, bindings, reference, *, diagnostic
                 common_definitions=None, code_regions=None):
     """Bound code and native inline data once for both the gate and reviews."""
     _checked_origin(origin)
+    native_section, function_start, function_end = coff.function_owner(section)
     _layout_code_window(coff, bindings, reference, origin, size, common_definitions)
     for _, owned_section, address, length in executable_data_definitions(
             coff, bindings, reference, common_definitions=common_definitions).values():
-        if section is owned_section or (origin < address + length and address < origin + size):
+        if native_section is owned_section or (origin < address + length and address < origin + size):
             raise ValueError("Code window overlaps a complete executable data contribution")
     _layout_call(validate_common_definitions, coff, bindings, reference, common_definitions,
         code_regions=code_regions)
@@ -1008,8 +1096,9 @@ def _code_window(coff, section, origin, size, bindings, reference, *, diagnostic
             raise ValueError(f"Byte indices require an explicit inline table: {name}")
         if "inline_data" not in binding:
             continue
-        _, table_section = coff.definition(name)
-        if table_section is section:
+        table_symbol, table_section = coff.definition(name)
+        if (table_section is native_section
+                and function_start <= table_symbol["value"] < function_end):
             tables.append((name, inline_table(coff, name, bindings)))
     if tables:
         tables.sort(key=lambda item: item[1]["start"])
@@ -1017,9 +1106,9 @@ def _code_window(coff, section, origin, size, bindings, reference, *, diagnostic
             if previous["end"] + len(previous["alignment_padding"]) != following["start"]:
                 raise ValueError("Inline data definitions must cover the complete native table suffix")
         last = tables[-1][1]
-        if last["end"] + len(last["alignment_padding"]) != len(raw):
+        if last["end"] + len(last["alignment_padding"]) != function_end:
             raise ValueError("Unconfigured data follows native inline table")
-        start = tables[0][1]["start"]
+        start = tables[0][1]["start"] - function_start
         if size > start:
             raise ValueError("Configured code extent overlaps native inline data")
         mapping = dict(bindings)
@@ -1029,7 +1118,8 @@ def _code_window(coff, section, origin, size, bindings, reference, *, diagnostic
                          code_regions.for_code_window(mapping, owner, origin, size))
         if not diagnostic:
             alignment = inline_table_alignment(bindings[tables[0][0]], tables[0][0])
-            if start != (size + alignment - 1) // alignment * alignment:
+            if start != ((function_start + size + alignment - 1) // alignment * alignment
+                         - function_start):
                 raise BodyExtentError(f"Inline table offset {start} incompatible with original code extent {size}")
             gap = raw[size:start]
             if (any(byte != 0x90 for byte in gap)
@@ -1167,9 +1257,9 @@ class CodeRegions:
     def for_code_window(self, bindings, owner, origin, size):
         """Retain only the ordinary inline-table owner's checked extent update."""
         symbol, section = self.coff.definition(owner)
-        if (not is_function_type(symbol["type"]) or symbol["value"] != 0
-                or id(section) in self.sections):
+        if not is_function_type(symbol["type"]) or id(section) in self.sections:
             raise ValueError("Invalid ordinary code owner for region dependencies")
+        self.coff.function(owner)
         expected = deepcopy(self.bindings)
         previous = expected.get(owner)
         if previous is not None:
@@ -1185,6 +1275,7 @@ class CodeRegions:
 
     def validate_code_window(self, section, origin, size):
         """Ordinary code cannot also own any declared complete region bytes."""
+        section, _, _ = self.coff.function_owner(section)
         if id(section) in self.sections:
             raise ValueError("Duplicate COFF code contribution ownership")
         for region in self.regions.values():
@@ -1375,13 +1466,13 @@ class CodeRegions:
             if any(s["value"] != 0 for s in coff._section_functions(section)):
                 raise ValueError("Provider-owned code regions are unsupported")
             _validate_function_alias_bindings(
-                coff, section, address if is_function_type(symbol["type"]) else address - symbol["value"],
+                coff, section, address - symbol["value"],
                 self.bindings)
             return
         region = self.sections.get(id(section))
         if region is None:
             _validate_function_alias_bindings(
-                coff, section, address if is_function_type(symbol["type"]) else address - symbol["value"],
+                coff, section, address - symbol["value"],
                 self.bindings)
             return
         if self._metadata(region) is not section:

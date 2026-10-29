@@ -19,6 +19,7 @@ from test_coff_contract import coff_bytes, entry, DATA_FLAGS, inline_switch
 def make_shared(tmp_path, prefix=b"", *, prefix_reference=None, prefix_relocations=()):
     # Both native entries reach the shared load/return tail. References include
     # an internal call, a local branch label, an entry address and real data.
+    # The shared COMDAT needs whole-region ownership rather than function slices.
     code = bytearray(b"\x90" * 32)
     code[0:10] = b"\xe8" + bytes(4) + b"\xe9" + bytes(4)
     code[10:18] = b"\x68" + bytes(4) + b"\x58\xeb\x02"
@@ -31,7 +32,8 @@ def make_shared(tmp_path, prefix=b"", *, prefix_reference=None, prefix_relocatio
                {"name": "caller", "section": 3, "type": 0x20},
                {"name": "pointer", "section": 2, "value": 4}]
     raw = coff_bytes([
-        {"data": prefix + bytes(code), "relocations": [*prefix_relocations,
+        {"data": prefix + bytes(code), "flags": 0x60001020,
+         "relocations": [*prefix_relocations,
             (start + 1, 1, 0x14), (start + 6, 3, 0x14),
             (start + 11, 0, 6), (start + 21, 2, 6)]},
         {"name": ".data", "flags": DATA_FLAGS, "data": struct.pack("<II", 7, 0),

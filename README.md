@@ -410,12 +410,29 @@ provider adds no extra counted data row and does not establish final linker
 allocation or whole-link ownership.
 
 Identical source aliases can remain address bindings while a single canonical
-body is listed in `functions`. Multiple typed function symbols in one code
-section are accepted only when all start at offset zero; either name selects
-the same complete body. Every explicitly bound co-located alias must use the
+body is listed in `functions`. Co-located typed function symbols at offset zero
+select the same complete body. Every explicitly bound co-located alias must use the
 compared body's origin, including aliases referenced by code or data fixups.
 A counted entry's explicit address binding must also agree with its configured
-code address. Multiple distinct entry offsets and nonzero entry aliases fail.
+code address.
+
+An ordinary, non-COMDAT executable code section may contain multiple typed
+function entries if one starts at offset zero. Each complete function window
+ends at the next distinct typed entry or the section end; co-located aliases
+share that window. Static function records with auxiliary metadata are included;
+untyped labels never determine function bounds. Only native relocations wholly
+inside the selected window are rebased. Overlapping fixups and fixups crossing
+typed boundaries fail. Every explicit same-section binding must preserve the
+same original section origin and native offset, even for an unselected sibling.
+Unrelocated same-section CALL/JMP displacements remain ordinary compared bytes;
+no fixups or layout normalization are invented. The complete original body and
+bounded trailing NOP rule still apply. Reports add `native_function_offset`,
+`native_function_end` and `native_section_size` to these function rows. This
+selects one function, without claiming equality of unselected section bytes.
+Multi-entry COMDAT sections and unnamed code prefixes still require an explicit
+complete `code_regions` contract; COMMON-provider code with nonzero typed
+entries remains unsupported.
+
 Each object can count a symbol only once; local
 symbol names may repeat in other objects. Original code windows must be unique
 and nonoverlapping across modules and roles for each target. Native
@@ -443,8 +460,10 @@ boundary immediately after the complete configured code extent. This option
 requires `inline_data: true` and `data_size`, and cannot be used for byte-index
 tables, ordinary data, COMMON storage or executable-data contributions. Every
 pointer remains four bytes with an exact, contiguous native DIR32 fixup.
-Code sections with inline tables still require exactly one typed function
-symbol; table ownership is not inferred from co-located aliases.
+Each inline table requires exactly one typed function owner in its bounded
+window; table ownership is not inferred from co-located aliases. An ordinary
+function's tables and case targets must remain within that native function
+window, and the complete table suffix and padding must reach its end.
 A following byte-index table also declares `inline_index_for` naming its pointer
 table. Native offsets, contiguous pointer fixups, index values, the complete
 table suffix and bounded alignment are validated. Tables are counted as data,
@@ -497,8 +516,8 @@ offset. The exact configured size must equal the whole contribution, including
 all padding; no
 subsection selection or tail trimming is allowed. The original range must be
 executable and completely file-backed. Regions may not overlap any configured
-code or complete data window, and a native contribution may have only one owner
-across functions, labels and regions. Ordinary `inline_data` and byte-index table
+code or complete data window, and a region's native contribution cannot also be
+owned by function or label windows. Ordinary `inline_data` and byte-index table
 roles inside regions remain unsupported.
 
 A region can explicitly declare complete native relocation vectors interleaved
@@ -532,13 +551,14 @@ unchanged.
 
 Ordinary DIR32/REL32 fixups and complete data/COMMON checks apply unchanged.
 Defined typed or local-label targets in a region must preserve their exact
-native offsets. Without an explicit region contract, references into a section
-with nonzero typed entries fail. Filtered function comparisons retain their
+native offsets. Ordinary multi-function sections retain the same origin checks;
+other sections with nonzero typed entries require explicit region contracts.
+Filtered function comparisons retain their
 same-object region contracts as uncounted dependencies: a reference to either
 entry validates the complete region bytes, all sibling entry bindings and its
 data dependencies. A context cannot authorize another object, reference or
 binding namespace, and successful byte results are not cached. Ordinary inline
-functions and compiler-label/function/zero-offset-alias gates remain strict.
+functions and compiler-label/function/alias gates remain strict.
 Caller-supplied recursion sets cannot authorize a region: only the same active
 native comparison may break its internal pointer cycles.
 
