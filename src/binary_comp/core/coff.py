@@ -673,6 +673,11 @@ def section_layout_definitions(coff, bindings, reference, *, common_definitions=
         size = len(section["data"])
         if not 0 <= origin < origin + size <= 0x100000000:
             raise ValueError("Section layout range outside i386 address domain")
+        alignment = (flags >> 20) & 0xF
+        if alignment == 0xF:
+            raise ValueError("Unsupported native section layout alignment")
+        if alignment and origin % (1 << (alignment - 1)):
+            raise ValueError("Section layout original origin violates native alignment")
         if not callable(getattr(reference, "section_for_va", None)):
             raise ValueError("Section layouts require original section metadata")
         backing = reference.section_for_va(origin)

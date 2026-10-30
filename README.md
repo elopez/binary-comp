@@ -303,6 +303,12 @@ fixups remain checked individually, then the entire section is compared using
 the native fixup engine. This includes unnamed leading bytes and all padding.
 The constraint adds no report rows, bytes or fixups to progress totals.
 
+Explicit COFF alignment encodings 1 through 14 require that contribution origin
+to be aligned to 1 through 8192 bytes, respectively; an interior anchor itself
+need not have the section's alignment. Encoding zero remains unspecified here
+and adds no alignment check; unsupported encoding 15 is rejected. These checks
+apply only to complete section layouts, not standalone data bindings.
+
 This deliberately strict opt-in requires exactly one valid native section
 auxiliary record and distinct strong storage-2/3 ordinary definitions, without
 runtime auxiliaries or function types. Scalar and array types are supported.

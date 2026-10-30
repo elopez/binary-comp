@@ -20,7 +20,7 @@ def aux(size, relocations=0):
     return struct.pack("<IHHIHBBH", size, relocations, 0, 0, 0, 0, 0, 0)
 
 
-def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=()):
+def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=(), alignment_flags=0):
     caller = b"\xa1" + bytes(4) + b"\xc3"
     data = bytes(12) if bss else b"head" + struct.pack("<II", 17, 3) + b"abcdefgh"
     offsets = (0, 4, 8) if bss else (4, 8, 12)
@@ -37,7 +37,7 @@ def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=()):
         data = bytes(4) + data[4:]
     c = COFF.from_bytes(coff_bytes([
         {"data": caller, "relocations": [(1, 2, 6)]},
-        {"name": ".data", "flags": BSS_FLAGS if bss else DATA_FLAGS,
+        {"name": ".data", "flags": (BSS_FLAGS if bss else DATA_FLAGS) | alignment_flags,
          "data": data, "size": len(data), "relocations": relocations},
     ], symbols))
     expected = bytearray(data)
@@ -76,6 +76,48 @@ def test_interior_anchor_typed_scalar_array_pointer_and_unchanged_totals(case, t
     assert sum(row["size"] for row in result["data"]) == 16
     assert sum(row["checked_fixups"] for row in result["data"]) == 1
     assert len(result["code"]) == 1 and result["code"][0]["checked_fixups"] == 1
+
+
+def test_explicit_alignment_uses_contribution_origin_not_interior_anchor(tmp_path):
+    case = make_case(tmp_path, bss=True, alignment_flags=0x00400000)
+    c, _, b, image = case
+    assert DATA_VA % 8 == 0 and int(b["pointer"]["va"], 16) % 8 == 4
+    assert check(case)[0]
+    assert validate_data_binding(c, "scalar", b, image) == (bytes(4), 0)
+
+
+@pytest.mark.parametrize("api", ["data", "function"])
+def test_misaligned_origin_rejects_before_original_reads(tmp_path, api):
+    c, f, b, image = make_case(tmp_path, bss=True, alignment_flags=0x00400000)
+    for binding in b.values():
+        binding["va"] = hex(int(binding["va"], 16) + 4)
+
+    class NoReads:
+        def section_for_va(self, address):
+            return image.section_for_va(address)
+
+        def read(self, address, size):
+            raise AssertionError("Alignment must reject before original bytes are read")
+
+    with pytest.raises(ValueError, match="original origin violates native alignment"):
+        if api == "data":
+            validate_data_binding(c, "scalar", b, NoReads())
+        else:
+            compare_function(c, f, "sample", b, NoReads())
+    del b["pointer"]["section_layout"]
+    assert validate_data_binding(c, "scalar", b, image) == (bytes(4), 0)
+
+
+@pytest.mark.parametrize("alignment_flags", [0, 0x00F00000])
+def test_unspecified_and_unsupported_layout_alignment(tmp_path, alignment_flags):
+    c, _, b, image = make_case(tmp_path, bss=True, alignment_flags=alignment_flags)
+    for binding in b.values():
+        binding["va"] = hex(int(binding["va"], 16) + 4)
+    if alignment_flags:
+        with pytest.raises(ValueError, match="Unsupported native section layout alignment"):
+            validate_data_binding(c, "scalar", b, image)
+    else:
+        assert validate_data_binding(c, "scalar", b, image) == (bytes(4), 0)
 
 
 @pytest.mark.parametrize("value", [False, 0, 1, "true", None, [], {}])
@@ -336,7 +378,7 @@ def test_direct_function_and_region_windows_cover_unnamed_layout_prefix(case):
         CodeRegions(c, [region], "sample", b, image)
 
 
-@pytest.mark.parametrize("mutation", ["syntax", "origin", "metadata", "prefix", "sibling", "overlap"])
+@pytest.mark.parametrize("mutation", ["syntax", "origin", "alignment", "metadata", "prefix", "sibling", "overlap"])
 @pytest.mark.parametrize("filtered", [False, True])
 def test_cli_clears_stale_summaries_for_early_and_late_errors(case, tmp_path, mutation, filtered):
     c, _, b, _ = case
@@ -344,6 +386,12 @@ def test_cli_clears_stale_summaries_for_early_and_late_errors(case, tmp_path, mu
         b["pointer"]["section_layout"] = 1
     elif mutation == "origin":
         b["array"]["va"] = hex(DATA_VA + 13)
+    elif mutation == "alignment":
+        raw = bytearray(c.data)
+        struct.pack_into("<I", raw, 96, DATA_FLAGS | 0x00400000)
+        c.data = bytes(raw)
+        for binding in b.values():
+            binding["va"] = hex(int(binding["va"], 16) + 4)
     elif mutation == "metadata":
         raw = bytearray(c.data)
         # Reparse a truly malformed native auxiliary record through the CLI.
