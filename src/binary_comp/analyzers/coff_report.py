@@ -16,7 +16,7 @@ import re
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
                                    compare_function, executable_data_definitions, executable_data_size,
-                                   inline_table_alignment, inline_vector_records, is_function_type, section_layout_definitions, section_layout_size,
+                                   inline_table_alignment, inline_vector_records, is_function_type, section_layout_definitions, section_layout_only, section_layout_size,
                                    validate_common_definitions,
                                    validate_data_binding)
 from binary_comp.core.pe import FileBackedPEImage
@@ -291,6 +291,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                 try:
                     executable_data_size(symbol, binding)
                     section_layout_size(symbol, binding)
+                    section_layout_only(symbol, binding)
                 except ValueError as error:
                     raise ConfigError(str(error)) from error
             _code_bindings(bindings.get(target_name, {}),

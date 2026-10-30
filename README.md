@@ -297,11 +297,25 @@ member binding; the anchor may be an interior definition:
 The exact boolean `true` enables this constraint; any other present value is an
 error. Every native runtime definition in the anchor's actual ordinary section,
 including unreferenced static definitions, needs an explicit full `data_size` or
-`data_hex` binding. Each binding's original address minus its native offset must
-give the same checked i386 section origin. All member roles, extents, bytes and
-fixups remain checked individually, then the entire section is compared using
-the native fixup engine. This includes unnamed leading bytes and all padding.
+`data_hex` binding unless explicitly marked as layout-only below. Each binding's
+original address minus its native offset must give the same checked i386 section
+origin. All native member roles and origins remain checked; complete member
+bindings retain individual extent, byte and fixup checks. The entire section is
+then compared using the native fixup engine, including unnamed leading bytes
+and all padding.
 The constraint adds no report rows, bytes or fixups to progress totals.
+
+A native interior member whose independent original extent or type is unresolved
+may instead have exactly `{"va": "0x402008", "section_layout_only": true}`. The
+exact boolean `true` is required, with no other binding keys. Its immediate
+native neighbors on both sides must have complete bindings in the same anchored
+ordinary section; leading, trailing, consecutive, unowned and provider-owned
+layout-only members are rejected. Native relocations targeting such a member
+are unsupported. Its bytes and outgoing fixups still participate in the strict
+whole-section comparison, including every padding byte. It has no independent
+data-validation API result or report row, and contributes no definition, byte or
+fixup counts. This establishes the complete source contribution's layout, not an
+independently recovered original object or type for that member.
 
 Explicit COFF alignment encodings 1 through 14 require that contribution origin
 to be aligned to 1 through 8192 bytes, respectively; an interior anchor itself

@@ -602,6 +602,17 @@ def section_layout_size(name, binding):
     return _ordinary_layout_size(name, binding)
 
 
+def section_layout_only(name, binding):
+    """Recognize an uncounted interior member of a complete ordinary layout."""
+    if "section_layout_only" not in binding:
+        return False
+    if (binding["section_layout_only"] is not True
+            or set(binding) != {"va", "section_layout_only"}):
+        raise ValueError(f"section_layout_only needs exactly va and true marker: {name}")
+    _binding_address(binding["va"], name)
+    return True
+
+
 def _ordinary_layout_size(name, binding):
     if ({"size", "inline_data", "inline_index_for", "inline_alignment", "executable_data"}
             & binding.keys() or ("data_size" in binding) == ("data_hex" in binding)):
@@ -626,6 +637,11 @@ def section_layout_definitions(coff, bindings, reference, *, common_definitions=
     owners = {}
     provider = (isinstance(common_definitions, Mapping)
                 and any(coff is item for item in common_definitions.values()))
+    layout_only = {name for name, binding in bindings.items() if section_layout_only(name, binding)}
+    claimed = set()
+    if provider and any(name in coff.named and coff.named[name]["section"] > 0
+                        for name in layout_only):
+        raise ValueError("Provider-owned section layouts are unsupported")
     for name, binding in bindings.items():
         if section_layout_size(name, binding) is None:
             continue
@@ -659,14 +675,21 @@ def section_layout_definitions(coff, bindings, reference, *, common_definitions=
                 raise ValueError(f"Unsupported native section layout definition: {member}")
             if member not in bindings:
                 raise ValueError(f"Section layout needs an explicit complete binding: {member}")
-            extent = _ordinary_layout_size(member, bindings[member])
-            if extent != coff.definition_extent(member):
+            extent = coff.definition_extent(member)
+            if member not in layout_only and _ordinary_layout_size(member, bindings[member]) != extent:
                 raise ValueError(f"Section layout extent differs from complete definition: {member}")
             origins.add(_binding_address(bindings[member]["va"], member) - symbol["value"])
             offsets.add(symbol["value"])
             members[member] = extent
         if metadata != 1 or name not in members:
             raise ValueError("Section layout needs exactly one valid native section auxiliary record")
+        ordered = sorted(members, key=lambda member: coff.named[member]["value"])
+        for i, member in enumerate(ordered):
+            if member in layout_only:
+                if (i == 0 or i == len(ordered) - 1
+                        or ordered[i - 1] in layout_only or ordered[i + 1] in layout_only):
+                    raise ValueError("Layout-only member needs complete known neighbors on both sides")
+                claimed.add(member)
         if len(origins) != 1:
             raise ValueError("Section layout definitions disagree on original origin")
         origin = origins.pop()
@@ -701,6 +724,13 @@ def section_layout_definitions(coff, bindings, reference, *, common_definitions=
             if origin < start + length and start < origin + size:
                 raise ValueError(f"Section layout overlaps configured code or data: {name}, {other}")
         owners[id(section)] = (name, section, origin, size, frozenset(members))
+    if not provider and layout_only != claimed:
+        raise ValueError("Layout-only member needs an anchored ordinary native section")
+    if claimed:
+        for section in coff.sections:
+            if any(coff.resolve_symbol(index)["name"] in claimed
+                   for _, index, _ in section["relocations"]):
+                raise ValueError("Relocation targets a layout-only member")
     return owners
 
 
@@ -788,6 +818,8 @@ def _validate_section_layouts(coff, bindings, reference, common_definitions=None
         # Nested fixups must not eagerly restart unrelated groups on that path.
         for _, section, origin, size, members in owners.values():
             for member in sorted(members):
+                if section_layout_only(member, bindings[member]):
+                    continue
                 _layout_call(validate_data_binding, coff, member, bindings, reference, set(),
                     common_definitions=common_definitions, code_regions=code_regions)
             actual, _ = _layout_call(apply_fixups, coff, section["data"], section["relocations"], origin,
@@ -937,6 +969,8 @@ def _validate_data_binding(coff, name, bindings, reference, visiting=None,
     if identity in visiting:
         raise ValueError(f"Cyclic data binding: {name}")
     binding = bindings[name]
+    if section_layout_only(name, binding):
+        raise ValueError(f"Layout-only member has no standalone data extent: {name}")
     inline_table_alignment(binding, name)
     address = _binding_address(binding["va"], name)
     common = coff.common_size(name)

@@ -20,7 +20,8 @@ def aux(size, relocations=0):
     return struct.pack("<IHHIHBBH", size, relocations, 0, 0, 0, 0, 0, 0)
 
 
-def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=(), alignment_flags=0):
+def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=(), alignment_flags=0,
+              layout_only=False):
     caller = b"\xa1" + bytes(4) + b"\xc3"
     data = bytes(12) if bss else b"head" + struct.pack("<II", 17, 3) + b"abcdefgh"
     offsets = (0, 4, 8) if bss else (4, 8, 12)
@@ -36,7 +37,7 @@ def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=(), alig
     if prefix_fixup:
         data = bytes(4) + data[4:]
     c = COFF.from_bytes(coff_bytes([
-        {"data": caller, "relocations": [(1, 2, 6)]},
+        {"data": caller, "relocations": [(1, 1 if layout_only else 2, 6)]},
         {"name": ".data", "flags": (BSS_FLAGS if bss else DATA_FLAGS) | alignment_flags,
          "data": data, "size": len(data), "relocations": relocations},
     ], symbols))
@@ -45,10 +46,14 @@ def make_case(tmp_path, *, bss=False, prefix_fixup=False, extra_symbols=(), alig
         struct.pack_into("<I", expected, 8, DATA_VA + 7)
     if prefix_fixup:
         struct.pack_into("<I", expected, 0, DATA_VA + 4)
-    image = reference(tmp_path, b"\xa1" + struct.pack("<I", DATA_VA + offsets[1]) + b"\xc3", bytes(expected) + (bytes(32 - len(expected)) if bss else b""))
+    image = reference(tmp_path, b"\xa1" + struct.pack("<I", DATA_VA + offsets[0 if layout_only else 1]) + b"\xc3", bytes(expected) + (bytes(32 - len(expected)) if bss else b""))
     b = {name: {"va": hex(DATA_VA + offset), "data_size": c.definition_extent(name)}
          for name, offset in zip(("scalar", "pointer", "array"), offsets)}
-    b["pointer"]["section_layout"] = True
+    if layout_only:
+        b["pointer"] = {"va": b["pointer"]["va"], "section_layout_only": True}
+        b["scalar"]["section_layout"] = True
+    else:
+        b["pointer"]["section_layout"] = True
     return c, entry("caller", TEXT_VA, 6), b, image
 
 
@@ -76,6 +81,122 @@ def test_interior_anchor_typed_scalar_array_pointer_and_unchanged_totals(case, t
     assert sum(row["size"] for row in result["data"]) == 16
     assert sum(row["checked_fixups"] for row in result["data"]) == 1
     assert len(result["code"]) == 1 and result["code"][0]["checked_fixups"] == 1
+
+
+@pytest.mark.parametrize("bss", [False, True])
+def test_layout_only_interior_bytes_and_fixups_add_no_definition_rows(tmp_path, bss):
+    c, _, b, image = case = make_case(tmp_path, bss=bss, layout_only=True, alignment_flags=0x00300000)
+    assert check(case)[0]
+    with pytest.raises(ValueError, match="no standalone data extent"):
+        validate_data_binding(c, "pointer", b, image)
+    p = project(case, tmp_path)
+    assert report(p[2], p[3], ["sample"], tmp_path / "report") == 0
+    result = json.loads((tmp_path / "report" / "report.json").read_text())
+    assert {row["symbol"] for row in result["data"]} == {"scalar", "array"}
+    assert sum(row["size"] for row in result["data"]) == (8 if bss else 12)
+    assert sum(row["checked_fixups"] for row in result["data"]) == 0
+    b["pointer"] = {"va": b["pointer"]["va"], "data_size": 4}
+    assert report(p[2], p[3], ["sample"], tmp_path / "full") == 0
+    full = json.loads((tmp_path / "full" / "report.json").read_text())
+    assert full["code"] == result["code"]
+    assert [row for row in full["data"] if row["symbol"] != "pointer"] == result["data"]
+    assert sum(row["size"] for row in full["data"]) == (12 if bss else 16)
+    assert sum(row["checked_fixups"] for row in full["data"]) == (0 if bss else 1)
+
+
+@pytest.mark.parametrize("mutation", ["false", "integer", "data_size", "data_hex", "size",
+                                     "section_layout", "inline_data", "unknown_key"])
+def test_layout_only_exact_marker_schema_in_core_and_cli(tmp_path, mutation):
+    case = make_case(tmp_path, layout_only=True)
+    binding = case[2]["pointer"]
+    if mutation in ("false", "integer"):
+        binding["section_layout_only"] = False if mutation == "false" else 1
+    else:
+        binding[mutation] = 4 if mutation in ("data_size", "size") else True
+    with pytest.raises(ValueError):
+        check(case)
+    p = project(case, tmp_path)
+    assert main(arguments(p)) != 0
+
+
+@pytest.mark.parametrize("mutation", ["leading", "trailing", "adjacent", "no_anchor", "foreign",
+                                     "common", "function", "provider", "origin", "extent"])
+def test_layout_only_cannot_hide_missing_ownership_or_complete_neighbors(tmp_path, mutation):
+    c, _, b, _ = case = make_case(tmp_path, layout_only=True)
+    if mutation in ("leading", "trailing", "adjacent"):
+        name = "scalar" if mutation == "leading" else "array"
+        if mutation != "adjacent":
+            b["pointer"] = {"va": b["pointer"]["va"], "data_size": 4}
+        b[name] = {"va": b[name]["va"], "section_layout_only": True}
+        b["pointer" if name == "scalar" else "scalar"]["section_layout"] = True
+    elif mutation == "no_anchor":
+        del b["scalar"]["section_layout"]
+    elif mutation == "foreign":
+        b["missing"] = b.pop("pointer")
+    elif mutation == "common":
+        c.named["pointer"].update(section=0, value=4)
+    elif mutation == "function":
+        c.named["pointer"]["type"] = 0x24
+    elif mutation == "origin":
+        b["pointer"]["va"] = hex(DATA_VA + 9)
+    elif mutation == "extent":
+        b["array"]["data_size"] -= 1
+    with pytest.raises(ValueError):
+        check(case, **({"common_definitions": {"other": c}} if mutation == "provider" else {}))
+
+
+@pytest.mark.parametrize("mutation", ["byte", "addend", "kind", "index", "cross_member", "incoming"])
+def test_layout_only_still_checks_every_byte_and_native_fixup(tmp_path, mutation):
+    c, _, b, _ = case = make_case(tmp_path, layout_only=True)
+    section = c.sections[1]
+    if mutation in ("byte", "addend"):
+        raw = bytearray(section["data"])
+        raw[8 if mutation == "byte" else 9] ^= 1
+        section["data"] = bytes(raw)
+    elif mutation == "incoming":
+        c.sections[0]["relocations"] = [(1, 2, 6)]
+    else:
+        section["relocations"] = [{"kind": (8, 1, 7), "index": (8, 99, 6),
+                                   "cross_member": (10, 1, 6)}[mutation]]
+    with pytest.raises(ValueError):
+        check(case)
+
+
+@pytest.mark.parametrize("collision", [False, True])
+def test_layout_only_members_stay_in_consumer_namespace(tmp_path, collision):
+    c, _, b, _ = case = make_case(tmp_path, bss=True, layout_only=True,
+                                 extra_symbols=[{"name": "buffer", "value": 4}])
+    symbols = [{"name": "buffer", "section": 1}]
+    if collision:
+        symbols.append({"name": "pointer", "section": 1, "value": 4})
+    provider = COFF.from_bytes(coff_bytes([
+        {"name": ".data", "flags": DATA_FLAGS, "data": bytes(8 if collision else 4)}], symbols))
+    b["buffer"] = {"va": hex(DATA_VA + 24), "data_size": 4}
+    if collision:
+        with pytest.raises(ValueError, match="Provider-owned"):
+            check(case, common_definitions={"buffer": provider})
+    else:
+        assert check(case, common_definitions={"buffer": provider})[0]
+
+
+@pytest.mark.parametrize("mutation", ["syntax", "opaque_bytes", "orphan"])
+def test_layout_only_filtered_cli_clears_stale_summaries(tmp_path, mutation):
+    c, _, b, _ = case = make_case(tmp_path, layout_only=True)
+    if mutation == "syntax":
+        b["pointer"]["section_layout_only"] = 1
+    elif mutation == "orphan":
+        del b["scalar"]["section_layout"]
+    else:
+        raw = bytearray(c.data)
+        raw[struct.unpack_from("<I", raw, 80)[0] + 8] ^= 1
+        c.data = bytes(raw)
+    p = project(case, tmp_path)
+    output = tmp_path / "report"
+    output.mkdir()
+    for name in ("report.json", "report.txt"):
+        (output / name).write_text("stale success")
+    assert main(arguments(p, filtered=True)) != 0
+    assert not (output / "report.json").exists() and not (output / "report.txt").exists()
 
 
 def test_explicit_alignment_uses_contribution_origin_not_interior_anchor(tmp_path):
