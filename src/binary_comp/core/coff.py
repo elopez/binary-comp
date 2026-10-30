@@ -593,6 +593,39 @@ def executable_data_definitions(coff, bindings, reference, *, common_definitions
     return owners
 
 
+def data_check_only_size(name, binding):
+    """Validate an explicit complete data check that contributes no coverage."""
+    if "data_check_only" not in binding:
+        return None
+    if (binding["data_check_only"] is not True
+            or set(binding) not in ({"va", "data_size", "data_check_only"},
+                                    {"va", "data_hex", "data_check_only"})):
+        raise ValueError(f"data_check_only needs va, one complete extent and true marker: {name}")
+    _binding_address(binding["va"], name)
+    return _ordinary_layout_size(name, binding)
+
+
+def _validate_data_check_only(coff, name, binding, common_definitions):
+    size = data_check_only_size(name, binding)
+    if size is None:
+        return
+    if (isinstance(common_definitions, Mapping)
+            and any(coff is item for item in common_definitions.values())):
+        raise ValueError("Provider-owned check-only data is unsupported")
+    definition, section = coff.definition(name)
+    flags = section["flags"]
+    if (definition["storage"] not in (2, 3) or definition["aux_count"]
+            or is_function_type(definition["type"]) or "weak_fallback" in definition
+            or definition["value"] != 0 or not flags & 0x40 or not flags & 0x1000
+            or flags & (0x20 | 0x80 | 0x200 | 0x800 | 0x02000000 | 0x20000000)
+            or size != len(section["data"]) or size != coff.definition_extent(name)):
+        raise ValueError(f"Check-only data needs a complete initialized COMDAT definition: {name}")
+    others = [s for s in coff.symbols.values()
+              if s["section"] == definition["section"] and s is not definition]
+    if len(others) != 1 or not _is_section_definition(coff, others[0], section):
+        raise ValueError(f"Check-only data needs sole ownership and valid native COMDAT metadata: {name}")
+
+
 def section_layout_size(name, binding):
     """Validate the true-only ordinary contribution constraint, when present."""
     if "section_layout" not in binding:
@@ -915,6 +948,7 @@ def _validate_common_definitions(coff, bindings, reference, common_definitions=N
         code_regions.check_context(coff, bindings, reference, common_definitions)
     for name, binding in bindings.items():
         inline_table_alignment(binding, name)
+        data_check_only_size(name, binding)
     if common_definitions is None:
         return
     if not isinstance(common_definitions, Mapping):
@@ -969,6 +1003,7 @@ def _validate_data_binding(coff, name, bindings, reference, visiting=None,
     if identity in visiting:
         raise ValueError(f"Cyclic data binding: {name}")
     binding = bindings[name]
+    _validate_data_check_only(coff, name, binding, common_definitions)
     if section_layout_only(name, binding):
         raise ValueError(f"Layout-only member has no standalone data extent: {name}")
     inline_table_alignment(binding, name)

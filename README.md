@@ -285,6 +285,23 @@ definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
 weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
 
+An emitted data definition can be fully checked without adding original-storage
+coverage by using `data_check_only: true` alongside `va` and exactly one complete
+`data_size` or `data_hex` extent. No other binding keys are allowed. This opt-in
+requires a sole strong initialized COMDAT data definition at offset zero, its
+complete native section extent and valid native section auxiliary metadata.
+Ordinary, BSS, COMMON, provider, undefined, weak, code, inline and section-layout
+roles are unsupported.
+
+All bytes and fixups still use normal complete-data validation, including when
+the definition is reached by a function's relocation. Reports and candidate
+scores also validate unreferenced selected checks. Reports put these results in
+an additive `data_checks` array, excluded from the `data` definition, byte and
+fixup totals; any failed check still fails the gate. Unmarked bindings and
+reports without checks retain their existing behavior and schema. This may
+validate duplicate source emissions; it establishes no canonical owner, alias
+relationship, unique original allocation or additional recovered coverage.
+
 Ordinary initialized or BSS contributions can additionally require a coherent
 complete section layout. Put `section_layout: true` on exactly one complete
 member binding; the anchor may be an interior definition:

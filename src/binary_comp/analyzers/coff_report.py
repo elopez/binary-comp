@@ -15,7 +15,7 @@ import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
-                                   compare_function, executable_data_definitions, executable_data_size,
+                                   compare_function, data_check_only_size, executable_data_definitions, executable_data_size,
                                    inline_table_alignment, inline_vector_records, is_function_type, section_layout_definitions, section_layout_only, section_layout_size,
                                    validate_common_definitions,
                                    validate_data_binding)
@@ -292,6 +292,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                     executable_data_size(symbol, binding)
                     section_layout_size(symbol, binding)
                     section_layout_only(symbol, binding)
+                    data_check_only_size(symbol, binding)
                 except ValueError as error:
                     raise ConfigError(str(error)) from error
             _code_bindings(bindings.get(target_name, {}),
@@ -680,7 +681,7 @@ def register_external_bindings(seen, coff, bindings, version, owner):
 
 
 def report(modules, targets, versions, output, *, manifest_path=None, source_root=None):
-    rows, data_rows = [], []
+    rows, data_rows, data_checks = [], [], []
     output = Path(output)
     object_hashes = {}
     provider_hashes = {}
@@ -816,8 +817,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                                                             else len(actual)))
                 except (ValueError, KeyError) as exc:
                     row.update(exact=False, error=str(exc))
-                data_rows.append(row)
-    if not rows and not data_rows:
+                (data_checks if data_check_only_size(name, binding) is not None else data_rows).append(row)
+    if not rows and not data_rows and not data_checks:
         raise ValueError("No configured code or data selected")
     result = {
         "schema": 1,
@@ -842,6 +843,12 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         },
         "code": rows, "data": data_rows,
     }
+    if data_checks:
+        result["data_checks"] = data_checks
+        result["semantics"]["data_checks"] = (
+            "Complete initialized COMDAT definitions checked with all bytes and fixups; "
+            "excluded from coverage counts, bytes and fixups; failures remain fatal; "
+            "no canonical storage or alias relationship is established")
     (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     lines = ["binary-comp COFF-stage report; mnemonic similarity is not byte equality."]
     for row in rows:
@@ -886,9 +893,15 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     lines.append(f"Data: {len(accepted_data)}/{len(data_rows)} complete definitions exact; "
                  f"{sum(r['size'] for r in accepted_data)} bytes; "
                  f"{sum(r['checked_fixups'] for r in accepted_data)} checked data fixups.")
+    if data_checks:
+        for row in data_checks:
+            if not row["exact"]:
+                lines.append(f"FAIL DATA CHECK {row['version']} {row['symbol']}: {row['error']}")
+        lines.append(f"Data checks: {sum(r['exact'] for r in data_checks)}/{len(data_checks)} "
+                     "complete definitions exact; excluded from coverage totals.")
     lines.append("Scope excludes unknown/protected code. Whole executable equality and behavior are not tested.")
     (output / "report.txt").write_text("\n".join(lines) + "\n")
     print("\n".join(lines))
     print(f"JSON and per-body binary-comp reviews: {output}")
     return sum("error" in r or "metric_error" in r or not r.get("relocated_bytes", {}).get("exact", False)
-               for r in rows) + sum(not r["exact"] for r in data_rows)
+               for r in rows) + sum(not r["exact"] for r in data_rows + data_checks)
