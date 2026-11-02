@@ -1395,12 +1395,39 @@ def run_coff_compare(args) -> int:
     return 0
 
 
+def add_coff_globalize_parser(subparsers) -> None:
+    parser = subparsers.add_parser("coff-globalize", help="Expose named static COMDAT functions with storage-byte edits only")
+    parser.add_argument("input", help="Input i386 COFF object")
+    parser.add_argument("output", help="Separate output i386 COFF object")
+    parser.add_argument("--function", action="append", required=True, metavar="NAME",
+                        help="Static COMDAT function to expose; repeat as needed")
+    parser.set_defaults(handler=run_coff_globalize)
+
+
+def run_coff_globalize(args) -> int:
+    from binary_comp.core.coff import COFF
+    from binary_comp.core.coff_visibility import globalize_coff_functions
+
+    try:
+        source, destination = Path(args.input), Path(args.output)
+        if source.resolve() == destination.resolve() or destination.exists() and source.samefile(destination):
+            raise ValueError("Input and output must be separate files")
+        output, witness = globalize_coff_functions(COFF(source), args.function)
+        destination.write_bytes(output)
+    except (OSError, ValueError) as error:
+        print(json.dumps({"operation": "coff-function-visibility", "error": str(error)}, sort_keys=True))
+        return 1
+    print(json.dumps(witness, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="binary-comp")
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_calls_parser(subparsers)
     add_compare_parser(subparsers)
     add_coff_compare_parser(subparsers)
+    add_coff_globalize_parser(subparsers)
     add_exepack_unpack_parser(subparsers)
     add_export_asm_parser(subparsers)
     add_seh_parser(subparsers)

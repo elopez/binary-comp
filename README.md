@@ -218,6 +218,35 @@ function sizes. It establishes preservation relative to the supplied baseline;
 it does not verify new function bodies against an executable, claim whole-file
 equality or change the native COFF-to-PE comparison gate.
 
+### Expose static COMDAT function visibility
+
+For explicitly named compiler-generated static functions that need public
+visibility for native linker ordering, use a separate output object:
+
+```bash
+binary-comp coff-globalize input.obj exposed.obj \
+  --function _static_one --function _static_two
+```
+
+The core API is
+`binary_comp.core.coff_visibility.globalize_coff_functions(coff, names)`, returning
+`(bytes, witness)` or raising `ValueError`. Each name must identify exactly one
+primary record: an auxiliary-free storage-3 typed function at offset zero, the
+sole typed function and native leader of an independent executable code COMDAT.
+Public, weak, COMMON, data, interior and ambiguous symbols are rejected. Strict
+native COFF preflight validates existing auxiliary, relocation and association
+shapes without either metadata-comparison opt-in.
+
+Only the selected primary storage bytes change from 3 (static) to 2 (external).
+The symbol table must not overlap headers, raw sections or relocations. The
+output is reparsed and its exact byte-difference set verified; instruction/data
+bytes, relocation records/addends, checksums, flags, names, indices, padding and
+all other file bytes remain unchanged. The JSON witness includes input/output
+hashes and every changed symbol's index, storage-byte offset, old/new storage,
+section, type and value. CLI rejection exits 1, and same-file output aliases are
+rejected. This changes link visibility only; it does not establish source
+recovery, native-PE equality or whole-file equality.
+
 ## Configuration
 
 The standalone config is target-oriented. A target describes the original PE,
