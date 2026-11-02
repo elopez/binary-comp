@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import sys
 from pathlib import Path
@@ -1365,11 +1366,41 @@ def run_globals(args) -> int:
     return 0
 
 
+def add_coff_compare_parser(subparsers) -> None:
+    parser = subparsers.add_parser("coff-compare", help="Verify explicitly enumerated native COFF function additions")
+    parser.add_argument("baseline", help="Baseline i386 COFF object")
+    parser.add_argument("candidate", help="Candidate i386 COFF object")
+    parser.add_argument("--added-function", action="append", default=[], metavar="NAME",
+                        help="One added public relocation-free .text COMDAT function; repeat as needed")
+    parser.add_argument("--allow-source-path-change", action="store_true",
+                        help="Allow .file path changes with identical source basenames; report each change")
+    parser.add_argument("--allow-nonselecting-checksum-change", action="store_true",
+                        help="Report checksum changes for ordinary/associative sections after full preservation checks")
+    parser.set_defaults(handler=run_coff_compare)
+
+
+def run_coff_compare(args) -> int:
+    from binary_comp.core.coff import COFF
+    from binary_comp.core.coff_extension import compare_coff_extension
+
+    try:
+        result = compare_coff_extension(COFF(args.baseline), COFF(args.candidate),
+                                        args.added_function,
+                                        allow_source_path_change=args.allow_source_path_change,
+                                        allow_nonselecting_checksum_change=args.allow_nonselecting_checksum_change)
+    except (OSError, ValueError) as error:
+        print(json.dumps({"equivalent": False, "error": str(error)}, sort_keys=True))
+        return 1
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="binary-comp")
     subparsers = parser.add_subparsers(dest="command", required=True)
     add_calls_parser(subparsers)
     add_compare_parser(subparsers)
+    add_coff_compare_parser(subparsers)
     add_exepack_unpack_parser(subparsers)
     add_export_asm_parser(subparsers)
     add_seh_parser(subparsers)

@@ -152,6 +152,72 @@ The optional dependencies are split by feature:
 - `binary-comp[cpp]` for C/C++ source annotation parsing.
 - `binary-comp[all]` for both plus pytest.
 
+## Native COFF extension checks
+
+Compare a baseline i386 COFF object with a candidate that adds explicitly named,
+independent public functions:
+
+```bash
+binary-comp coff-compare baseline.obj candidate.obj \
+  --added-function _first_helper --added-function _second_helper
+```
+
+The command emits a JSON witness and exits zero only when all baseline
+contributions remain equivalent. Rejections emit `equivalent: false` and the
+first diagnostic, with exit status 1. No configuration, compiler or reference
+executable is required. The core API is
+`binary_comp.core.coff_extension.compare_coff_extension(baseline, candidate,
+added_functions=(), *, allow_source_path_change=False,
+allow_nonselecting_checksum_change=False)`, where the inputs are
+existing `COFF` instances; rejection raises `ValueError`.
+
+Each named addition must occupy its own nonempty executable `.text` COMDAT,
+with no relocations, data flags or writable flag. It must contain exactly its
+section-definition record and one typed external function at offset zero,
+without function auxiliaries. All other sections retain their exact order after
+those enumerated additions are excluded. Their names, flags, virtual metadata,
+complete raw bytes (including relocation addends), BSS allocation sizes,
+relocation offset/kind/order and target identities must agree. Original symbol
+types, storage classes, values, multiplicities, public/global/function names and
+COMMON sizes also agree. An existing undefined external declaration of a named
+addition may remain or be replaced once by that function's definition.
+
+Section and symbol table indices may renumber. Only section-local, untyped,
+auxiliary-free storage-3/6 labels may change spelling; their mapped section,
+offset, type, storage and multiplicity remain exact. Section auxiliaries retain
+length, relocation/line counts, checksum, selection and reserved bytes;
+associative COMDAT section indices are mapped and association cycles rejected.
+Existing associative metadata sections may contain only their section symbol.
+Weak externals retain their names, type/storage/value, search policy, reserved
+bytes and fallback identities, with cyclic or ambiguous targets rejected.
+Known function auxiliaries retain their size and mapped symbol references.
+Unknown auxiliaries, legacy line tables, relocation overflow, unsupported i386
+relocation types and ambiguous index-bearing metadata are rejected. These checks
+use the [Microsoft PE/COFF auxiliary formats](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#auxiliary-symbol-records).
+
+Source-file auxiliaries compare exactly by default. For source copied between
+directories, `--allow-source-path-change` permits only genuine `.file` records
+with NUL-terminated, zero-padded paths and the same basename. File record counts
+and all other symbol metadata remain checked, while the number of filename
+auxiliary entries may vary. Every changed path appears in `source_path_changes`.
+
+The separate `--allow-nonselecting-checksum-change` opt-in permits section-auxiliary
+checksum differences only for ordinary sections (selection 0) and associative
+COMDAT sections (selection 5). The specification makes checksums applicable to
+COMDATs, while associative retention follows the checked parent section.
+Complete raw bytes, relocations, parent associations and every other auxiliary
+field must still agree. Checksums for independently selected COMDATs (selections
+1/2/3/4/6) always remain exact. Each permitted difference is reported with its
+section mapping, selection and before/after values in `section_checksum_changes`.
+
+This check never rewrites objects, masks operands, discovers matching sections
+by content or reorders baseline contributions. Physical file offsets,
+timestamps and unused string-table encodings are outside its scope. The witness
+records input hashes, the ordered section map, preserved counts and added
+function sizes. It establishes preservation relative to the supplied baseline;
+it does not verify new function bodies against an executable, claim whole-file
+equality or change the native COFF-to-PE comparison gate.
+
 ## Configuration
 
 The standalone config is target-oriented. A target describes the original PE,
