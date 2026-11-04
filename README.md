@@ -366,7 +366,37 @@ binary-comp report --config binary-comp.json --target retail --module Sample --n
 binary-comp compare --config binary-comp.json --target retail read_value --no-build
 ```
 
-`--target all` aggregates configured COFF targets into one report. `--module`
+To inspect a linked PE using these same function contracts, also configure the
+target's `rebuilt_exe` and MSVC `map` paths, then run:
+
+```sh
+binary-comp exe --config binary-comp.json --target retail --functions
+```
+
+This diagnostic authenticates the original image's SHA-256 and compares each
+selected `functions` entry's full configured extent with the same-sized window
+at its linked MAP address. It requires an exact decorated symbol and a unique
+object-member identity matching `<module name>.obj`; object names ignore case,
+Windows directory separators and library prefixes when selecting the member.
+Distinct full object paths or library identities with that member name remain
+ambiguous. Repeated identical MAP records are deduplicated, and separate function
+symbols may share a linked address. Missing, ambiguous or untyped MAP entries
+receive no equality credit. Both windows must be executable and entirely backed
+by file bytes. No window is shortened at another MAP symbol or a size cap, and
+no relocation operands are corrected or masked.
+
+The `Configured linked RAW windows` report counts only explicit `functions`;
+`code_labels`, `code_regions` and address-only bindings add no rows. It reads no
+objects or C++ sources and invokes no build, so the configured object directories
+need not contain built files. Linked-window equality does not verify source or
+COFF equality, linked function extents, behavior or whole-file equality. Use the
+strict COFF report separately for native source-contribution verification. As
+with the existing `exe` report, differences are diagnostic; input and validation
+errors return a nonzero status. The original digest is also checked when an
+`i386-coff` target uses `exe` without `--functions`.
+
+For strict COFF reports, `--target all` aggregates configured targets into one
+report. `--module`
 may be repeated. `--output` names the directory for `report.json`, `report.txt`
 and complete per-body byte/disassembly reviews; `compare` also prints the review.
 A COFF report always checks raw bytes and bytes after explicitly bound DIR32 or
@@ -852,7 +882,7 @@ original addresses for external function-pointer initializers. The `data`
 
 | Analyzer | Required target fields | Extra notes |
 | --- | --- | --- |
-| `exe` | `original_exe`, `rebuilt_exe`, `map`, `source_dirs` | `--functions` uses function annotations and the rebuilt MAP. `library_ranges` can exclude known CRT/library ranges. |
+| `exe` | `original_exe`, `rebuilt_exe`; legacy function mapping also needs `map`, `source_dirs` | Legacy `--functions` uses source annotations and supports `library_ranges`. An `i386-coff` target authenticates `original_sha256`; `--functions` reuses `coff.modules` and `map` for full configured linked RAW windows without source parsing or object reads. |
 | `export-asm` | `original_exe`, `code_export_dir` | Generates Ghidra-style `FUN_*.disassembled.txt` exports with Capstone. Source annotations and an original map are optional boundary inputs; existing Ghidra exports remain compatible. |
 | `compare` | `original_exe`, `rebuilt_exe`, `map`, `source_dirs` | Also takes one Ghidra-style `FUN_*.disassembled.txt` path. |
 | `report` | `original_exe`, `rebuilt_exe`, `map`, `source_dirs`, `code_export_dir` | Uses one export per annotated original address. Generate them with `export-asm` or Ghidra. |

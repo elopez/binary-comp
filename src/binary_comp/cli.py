@@ -1212,12 +1212,18 @@ def run_export_asm(args) -> int:
 def run_exe(args) -> int:
     try:
         _, target = load_project_target(args.config, args.target)
+        coff_modules = None
+        if args.functions and target.kind == "i386-coff":
+            from binary_comp.analyzers.coff_report import load_selection
+
+            coff_modules, _, _ = load_selection(args.config, args.target)
         comparison = compare_executable(
             target,
             ExeCompareOptions(
                 byte_sections=tuple(args.sections) if args.sections else (".text", ".rdata", ".data"),
                 include_functions=args.functions,
             ),
+            coff_modules=coff_modules,
         )
     except (ConfigError, FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 
-from binary_comp.config import ProjectTarget
-from binary_comp.core.mapfile import function_starts_from_map, parse_msvc_map_by_obj
-from binary_comp.core.pe import PEImage, Section
-from binary_comp.source.functions import load_source_groups, map_source_groups
+from binary_comp.config import ConfigError, ProjectTarget
+from binary_comp.core.mapfile import function_starts_from_map, parse_msvc_map_by_obj, parse_msvc_map_symbols
+from binary_comp.core.pe import EXECUTABLE_FLAG, FileBackedPEImage, PEImage, Section
+from binary_comp.source.functions import load_source_groups, map_source_groups, object_member_name
 
 
 DEFAULT_BYTE_SECTIONS = (".text", ".rdata", ".data")
@@ -73,6 +74,26 @@ class FunctionComparisonSummary:
 
 
 @dataclass(frozen=True)
+class LinkedFunctionComparisonRow:
+    module: str
+    label: str
+    symbol: str
+    original_addr: int
+    configured_size: int
+    rebuilt_addr: int | None = None
+    compared_size: int = 0
+    matching_bytes: int | None = None
+    raw_equal: bool | None = None
+    status: str = "missing"
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class LinkedFunctionComparisonSummary:
+    rows: tuple[LinkedFunctionComparisonRow, ...]
+
+
+@dataclass(frozen=True)
 class ExeComparison:
     original_path: str
     rebuilt_path: str
@@ -81,6 +102,7 @@ class ExeComparison:
     sections: tuple[SectionComparison, ...]
     byte_summaries: tuple[SectionByteComparison, ...]
     functions: FunctionComparisonSummary | None
+    linked_functions: LinkedFunctionComparisonSummary | None = None
 
 
 def section_by_name(image: PEImage) -> dict[str, Section]:
@@ -276,14 +298,29 @@ def compare_functions(
 def compare_executable(
     target: ProjectTarget,
     options: ExeCompareOptions = ExeCompareOptions(),
+    *,
+    coff_modules: list[dict] | None = None,
 ) -> ExeComparison:
-    original = PEImage(target.original_exe)
-    rebuilt = PEImage(target.rebuilt_exe)
-    functions = (
-        compare_functions(target, original, rebuilt, options.max_function_bytes)
-        if options.include_functions
-        else None
-    )
+    functions = None
+    linked_functions = None
+    if target.kind == "i386-coff":
+        from binary_comp.analyzers.coff_report import load_reference
+
+        if not target.rebuilt_exe:
+            raise ConfigError("i386-coff executable comparison needs rebuilt_exe")
+        original, _ = load_reference(target, target.name)
+        rebuilt = FileBackedPEImage(target.rebuilt_exe)
+        if options.include_functions:
+            if coff_modules is None:
+                raise ConfigError("i386-coff function mapping needs validated COFF modules")
+            if not target.map_path:
+                raise ConfigError("i386-coff function mapping needs map")
+            linked_functions = compare_linked_functions(target, original, rebuilt, coff_modules)
+    else:
+        original = PEImage(target.original_exe)
+        rebuilt = PEImage(target.rebuilt_exe)
+        if options.include_functions:
+            functions = compare_functions(target, original, rebuilt, options.max_function_bytes)
     return ExeComparison(
         original_path=target.original_exe,
         rebuilt_path=target.rebuilt_exe,
@@ -292,7 +329,114 @@ def compare_executable(
         sections=compare_sections(original, rebuilt),
         byte_summaries=compare_section_bytes(original, rebuilt, options.byte_sections),
         functions=functions,
+        linked_functions=linked_functions,
     )
+
+
+def executable_window(image: FileBackedPEImage, address: int, size: int) -> bytes:
+    section = image.section_for_va(address)
+    if section is None or not section.flags & EXECUTABLE_FLAG:
+        raise ValueError(f"VA {address:#x}+{size:#x} is not in an executable section")
+    if address + size > section.start + section.rawsize:
+        raise ValueError(f"VA {address:#x}+{size:#x} has no complete file-backed executable section")
+    return image.read(address, size)
+
+
+def compare_linked_functions(
+    target: ProjectTarget,
+    original: FileBackedPEImage,
+    rebuilt: FileBackedPEImage,
+    modules: list[dict],
+) -> LinkedFunctionComparisonSummary:
+    """Compare complete configured windows, without inferring linked extents."""
+    from binary_comp.analyzers.coff_report import validate_counted_code
+
+    validate_counted_code(modules, [target.name])
+    if not Path(target.map_path).is_file():
+        raise FileNotFoundError(f"MSVC MAP not found: {target.map_path}")
+    symbols = parse_msvc_map_symbols(target.map_path)
+    rows = []
+    for module in modules:
+        member = (module["name"] + ".obj").casefold()
+        for function in module.get("functions", []):
+            if target.name not in function:
+                continue
+            extent = function[target.name]
+            row = LinkedFunctionComparisonRow(
+                module["name"], function["label"], function["symbol"],
+                int(extent["va"], 16), extent["size"],
+            )
+            original_data = executable_window(original, row.original_addr, row.configured_size)
+            # Preserve full object provenance: two members with the same basename
+            # do not become one identity, even if their linked VAs coincide.
+            candidates = {}
+            for symbol in symbols:
+                if (symbol.symbol != row.symbol or symbol.object_file is None
+                        or object_member_name(symbol.object_file).casefold() != member):
+                    continue
+                identity = (symbol.segment, symbol.va, symbol.is_function,
+                            symbol.object_file.replace("\\", "/").casefold())
+                candidates.setdefault(identity, symbol)
+            if not candidates:
+                rows.append(replace(row, detail=f"No MAP identity in {member}"))
+                continue
+            if len(candidates) != 1:
+                rows.append(replace(row, status="ambiguous", detail=f"Multiple MAP identities in {member}"))
+                continue
+            symbol = next(iter(candidates.values()))
+            row = replace(row, rebuilt_addr=symbol.va)
+            if not symbol.is_function:
+                rows.append(replace(row, status="not-function", detail="MAP entry has no f flag"))
+                continue
+            try:
+                rebuilt_data = executable_window(rebuilt, symbol.va, row.configured_size)
+            except ValueError as error:
+                rows.append(replace(row, status="invalid-window", detail=str(error)))
+                continue
+            equal = original_data == rebuilt_data
+            rows.append(replace(
+                row, compared_size=row.configured_size,
+                matching_bytes=sum(left == right for left, right in zip(original_data, rebuilt_data)),
+                raw_equal=equal, status="raw-equal" if equal else "raw-different",
+            ))
+    return LinkedFunctionComparisonSummary(tuple(rows))
+
+
+def format_linked_functions(summary: LinkedFunctionComparisonSummary) -> list[str]:
+    rows = summary.rows
+    total = len(rows)
+    mapped = [row for row in rows if row.rebuilt_addr is not None and row.status != "not-function"]
+    same_address = sum(row.rebuilt_addr == row.original_addr for row in mapped)
+    lines = [
+        "", "=== Configured linked RAW windows ===",
+        f"  Configured functions: {total}",
+        f"  Mapped function identities: {len(mapped)}/{total}",
+        f"  At original address: {same_address}/{total}",
+        f"  Shifted: {len(mapped) - same_address}/{total}",
+        f"  Missing: {sum(row.status == 'missing' for row in rows)}/{total}",
+        f"  Ambiguous: {sum(row.status == 'ambiguous' for row in rows)}/{total}",
+        f"  Non-function MAP entries: {sum(row.status == 'not-function' for row in rows)}/{total}",
+        f"  Raw-equal configured windows: {sum(row.raw_equal is True for row in rows)}/{total}",
+        "  Full configured extents; exact raw operands; no relocation correction.",
+        "  This diagnostic does not verify source/COFF equality, linked function extents,",
+        "  behavior or whole-file equality.",
+        "",
+        f"  {'Original':>10} {'Rebuilt':>10} {'Size':>7} {'Matching':>15} {'Raw%':>6} Status / identity",
+    ]
+    for row in rows:
+        rebuilt = f"0x{row.rebuilt_addr:08X}" if row.rebuilt_addr is not None else "-------"
+        matching = (f"{row.matching_bytes}/{row.compared_size}"
+                    if row.matching_bytes is not None else "--")
+        percent = (f"{row.matching_bytes / row.compared_size * 100:.1f}%"
+                   if row.compared_size else "--")
+        lines.append(
+            f"  0x{row.original_addr:08X} {rebuilt:>10} {row.configured_size:>7} "
+            f"{matching:>15} {percent:>6} {row.status} "
+            f"{row.module}:{row.label} [{row.symbol}]"
+        )
+        if row.detail:
+            lines.append(f"    {row.detail}")
+    return lines
 
 
 def format_section(section: Section | None) -> tuple[str, str]:
@@ -365,6 +509,9 @@ def format_executable_comparison(comparison: ExeComparison) -> str:
                         f"(expected) -> 0x{row.rebuilt_addr:08X} (actual)"
                     )
                 break
+
+    if comparison.linked_functions is not None:
+        lines.extend(format_linked_functions(comparison.linked_functions))
 
     lines.extend(["", "=== Overall Summary ==="])
     total_matching = 0

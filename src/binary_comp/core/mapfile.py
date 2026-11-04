@@ -88,8 +88,15 @@ def parse_msvc_map_symbols(map_path: str) -> list[MapSymbol]:
             match = ANY_SEGMENT_SYMBOL_LINE_RE.match(line)
             if not match:
                 continue
-            rest = match.group("rest").split()
-            object_file = next((token for token in rest if token.endswith(".obj")), None)
+            tail = match.group("rest").strip()
+            rest = tail.split()
+            # Keep spaces in object paths: the full provenance distinguishes
+            # same-named members from different directories or libraries.
+            object_file = re.sub(r"^(?:f(?:\s+|$))?(?:i(?:\s+|$))?", "", tail)
+            if object_file.startswith('"') and object_file.endswith('"'):
+                object_file = object_file[1:-1]
+            if not object_file.lower().endswith(".obj"):
+                object_file = None
             symbols.append(MapSymbol(
                 segment=int(match.group("segment"), 16),
                 va=int(match.group("va"), 16),
