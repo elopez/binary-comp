@@ -193,14 +193,16 @@ def add_vtables_parser(subparsers) -> None:
 
 
 def add_data_parser(subparsers) -> None:
-    parser = subparsers.add_parser("data", help="Compare global data between original and rebuilt PE/LE images")
+    parser = subparsers.add_parser("data", help="Compare PE/LE globals or native-validated COFF linked data windows")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Project config path (default: {DEFAULT_CONFIG_PATH})")
     parser.add_argument("--target", default="full", help="Target name from config (default: full)")
     parser.add_argument("--globals-source", help="Global declarations source override")
-    parser.add_argument("--section", default=".data", help="Section to scan for --find-missing (default: .data)")
-    parser.add_argument("--verbose", action="store_true", help="Show data bytes for all globals")
+    parser.add_argument("--module", action="append", help="Limit i386-coff data contracts to named modules")
+    parser.add_argument("--output", help="i386-coff report.json/report.txt output directory")
+    parser.add_argument("--section", help="Section to scan for --find-missing (default: .data)")
+    parser.add_argument("--verbose", action="store_true", help="Show global bytes or i386-coff contract failure details")
     parser.add_argument("--address", type=lambda value: int(value, 0), help="Compare one original VA")
-    parser.add_argument("--size", type=int, default=32, help="Byte count for --address (default: 32)")
+    parser.add_argument("--size", type=int, help="Byte count for --address (default: 32)")
     parser.add_argument("--find-missing", action="store_true", help="Scan original section for untracked non-zero dwords")
     parser.add_argument("--min-address", type=lambda value: int(value, 0),
                         help="Only scan addresses >= this VA when using --find-missing")
@@ -832,6 +834,35 @@ def build_source_function_address_map(target: ProjectTarget, function_addresses:
 
 def run_data(args) -> int:
     try:
+        invalidate_report_summaries(args.output)
+        if coff_target_selection(args.config, args.target):
+            from dataclasses import asdict
+            from binary_comp.analyzers.coff_data import compare_linked_data, format_linked_data
+            from binary_comp.analyzers.coff_report import load_selection
+
+            if (args.globals_source is not None or args.section is not None
+                    or args.address is not None or args.size is not None or args.find_missing
+                    or args.min_address is not None or args.max_address is not None or args.skip_ranges):
+                raise ConfigError("i386-coff data uses explicit manifests; source, address and scan options are unsupported")
+            modules, targets, _ = load_selection(args.config, args.target, module_names=args.module)
+            summaries = {name: compare_linked_data(target, modules, allow_empty=args.target == "all")
+                         for name, target in targets.items()}
+            if not any(summary.rows for summary in summaries.values()):
+                raise ConfigError("No complete owned COFF data contracts selected")
+            text = "\n\n".join(f"Target: {name}\n{format_linked_data(summary, verbose=args.verbose)}"
+                                 for name, summary in summaries.items())
+            if args.output:
+                output = Path(args.output)
+                output.mkdir(parents=True, exist_ok=True)
+                (output / "report.json").write_text(json.dumps({
+                    "schema": 1, "scope": "Native-validated COFF data contracts and linked raw windows",
+                    "targets": {name: asdict(summary) for name, summary in summaries.items()},
+                }, indent=2) + "\n")
+                (output / "report.txt").write_text(text + "\n")
+            print(text)
+            return 0 if all(summary.matches for summary in summaries.values()) else 1
+        if args.module is not None or args.output is not None:
+            raise ConfigError("data --module and --output require an i386-coff target")
         config, target = load_project_target(args.config, args.target)
         globals_source = require_globals_source(args.globals_source or target.globals_source)
         extra_type_sizes = extract_globals_type_sizes(config)
@@ -840,7 +871,7 @@ def run_data(args) -> int:
             summary = find_missing_globals(
                 target.original_exe,
                 globals_source,
-                section_name=args.section,
+                section_name=args.section or ".data",
                 min_address=args.min_address,
                 max_address=args.max_address,
                 skip_ranges=skip_ranges,
@@ -854,7 +885,7 @@ def run_data(args) -> int:
                 target.rebuilt_exe,
                 target.map_path,
                 args.address,
-                args.size,
+                args.size if args.size is not None else 32,
             )
             print(format_address_comparison(comparison))
             return 0 if comparison.matches else 1
@@ -864,12 +895,12 @@ def run_data(args) -> int:
             target.rebuilt_exe,
             target.map_path,
             globals_source,
-            DataOptions(section_name=args.section, verbose=args.verbose),
+            DataOptions(section_name=args.section or ".data", verbose=args.verbose),
             extra_type_sizes=extra_type_sizes,
             relocated_address_map=build_source_function_address_map(
                 target, config.get("globals", {}).get("function_addresses", {})),
         )
-    except (ConfigError, FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (ConfigError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

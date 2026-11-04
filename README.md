@@ -404,6 +404,51 @@ with the existing `exe` report, differences are diagnostic; input and validation
 errors return a nonzero status. The original digest is also checked when an
 `i386-coff` target uses `exe` without `--functions`.
 
+Native linked data diagnostics use the same explicit COFF manifests:
+
+```sh
+binary-comp data --config binary-comp.json --target all --output data-report
+```
+
+This path authenticates each original image and reads caller-built objects,
+the actual MSVC MAP and rebuilt PE. It selects complete `data_size`/`data_hex`
+contracts, excluding address-only, layout-only and `data_check_only` bindings.
+Each selected contract must pass the existing strict data validator, including
+native definition extent, dependencies and explicit fixups, before it can earn
+linked raw equality credit. Object-contract status and checked fixup counts are
+reported separately from linked raw bytes. Failed or unresolved object contracts
+can still show same-owner MAP placement, but receive no raw equality credit.
+This command therefore diagnoses linked windows for validated contracts; use the
+strict COFF report to investigate failing object contracts.
+
+MAP selection requires the exact decorated data symbol and a unique matching
+native owner's object-member identity. Distinct full paths remain ambiguous.
+A unique exact non-function entry under `Publics by Value` may select another
+owner only after proving a real external native data definition (class 2).
+Static, weak, undefined and metadata records cannot authorize that fallback.
+Explicit validated strong COMMON providers use their own object identity;
+sectionless COMMON requests alone prove no linked allocation and earn no raw
+equality credit. Missing private symbols remain unresolved: the command neither
+scans bytes nor estimates addresses or lengths from neighboring MAP entries.
+
+Placement and raw equality are independent: a shifted window can contain the
+same bytes. Both complete configured windows must lie in a single unambiguous
+PE section and be fully file-backed. Virtual zero-fill and mixed file/zero-fill
+windows are explicitly classified and never credited as raw equality or proof
+of an allocation's extent. Every raw byte is compared without pointer relocation,
+operand masking or size caps. These are contract windows, not physical allocation
+counts, linked allocation extents, behavior or whole-file equality.
+
+`--target all` finishes every selected target's diagnostic, and `--module` can
+select native modules. `--output` writes `report.json` and `report.txt`, with
+addresses, native owner offsets, full MAP identities, backing categories,
+object proof/fixups, placement and raw equality, and exact compared byte counts.
+`--verbose` includes object-contract failure details. Exit status is 0 only when
+all selected windows have validated contracts, original placement and raw-equal
+file bytes; diagnostic differences or unresolved windows return 1, and malformed
+configuration or missing required inputs return 2. Native data mode rejects
+source, address and scan options; `--module` and `--output` require this backend.
+
 For strict COFF reports, `--target all` aggregates configured targets into one
 report. `--module`
 may be repeated. `--output` names the directory for `report.json`, `report.txt`
