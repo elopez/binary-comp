@@ -6,13 +6,14 @@ every source in their anchored component replays its complete linked window.
 """
 
 from dataclasses import dataclass, field
+import hashlib
 import struct
 
 from binary_comp.analyzers.coff_report import (
-    region_contracts, validate_native_role,
+    object_path, region_contracts, validate_native_role,
 )
 from binary_comp.analyzers.exe import linked_map_identity
-from binary_comp.core.coff import code_window, compare_code_region, compare_function, is_function_type
+from binary_comp.core.coff import COFF, code_window, compare_code_region, compare_function, is_function_type
 from binary_comp.source.functions import object_member_name
 
 
@@ -21,6 +22,62 @@ class GraphPlacement:
     address: int | None = None
     provenance: tuple[str, ...] = ()
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class _AbsoluteTerminal:
+    value: int | None = None
+    provenance: str = ""
+    detail: str = ""
+
+
+def load_absolute_definitions(target):
+    """Read explicitly selected absolute scalar definitions, never bindings.
+
+    Provider failures stay per-terminal diagnostics. All configured provider
+    objects participate in detecting conflicting definitions of selected names.
+    No section bytes, allocation, address aliases or weak fallbacks are used.
+    """
+    objects = {}
+    for _, filename in target.absolute_definitions:
+        if filename in objects:
+            continue
+        try:
+            path = object_path(target, filename)
+            objects[filename] = (COFF(path), path, "")
+        except (OSError, ValueError, RuntimeError) as error:
+            objects[filename] = (None, None, str(error))
+
+    def scalar(record):
+        return (record["storage"] == 2 and record["section"] == -1
+                and record["type"] == 0 and record["aux_count"] == 0
+                and "weak_fallback" not in record)
+
+    result = {}
+    for name, filename in target.absolute_definitions:
+        try:
+            coff, path, failure = objects[filename]
+            if failure:
+                raise ValueError(failure)
+            records = [(index, record) for index, record in coff.symbols.items() if record["name"] == name]
+            if len(records) != 1 or not scalar(records[0][1]):
+                raise ValueError("Provider needs exactly one strong native absolute type-0 scalar record")
+            index, native = records[0]
+            value = native["value"]
+            for other, _, error in objects.values():
+                if other is None:
+                    continue
+                matching = [record for record in other.symbols.values() if record["name"] == name]
+                definitions = [record for record in matching if record["section"] != 0 or record["value"]]
+                if definitions and (len(matching) != 1 or not scalar(definitions[0])
+                                    or definitions[0]["value"] != value):
+                    raise ValueError("Conflicting configured absolute provider definitions")
+            result[name] = _AbsoluteTerminal(
+                value, f"ABS provider {path} SHA256={hashlib.sha256(coff.data).hexdigest()} "
+                f"native index={index} storage=2 section=-1 type=0 value={value:#010x}")
+        except ValueError as error:
+            result[name] = _AbsoluteTerminal(detail=f"Invalid absolute provider for {name}: {error}")
+    return result
 
 
 @dataclass
@@ -58,7 +115,7 @@ def _map_candidates(symbols, name, owner, *, public=False):
 
 def resolve_private_placements(coff, module, version, bindings, reference, rebuilt,
                                symbols, validated_data, *, providers, regions,
-                               read_window):
+                               read_window, absolute_definitions=None):
     """Return diagnostics for complete owned private contracts, never aliases.
 
     ``validated_data`` contains only data definitions already accepted by the
@@ -68,6 +125,7 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
     """
     owner = module["name"] + ".obj"
     nodes, by_symbol, failures = {}, {}, {}
+    absolute_definitions = absolute_definitions or {}
 
     def add(node):
         if node.name in nodes:
@@ -253,8 +311,25 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                         inferred = (source + offset + 4 + displacement - addend) & 0xFFFFFFFF
                     else:
                         inferred = (field - addend) & 0xFFFFFFFF
-                    target_map = unique_map(name, native)
-                    if target_map is not None:
+                    absolute = absolute_definitions.get(name)
+                    target_map = unique_map(name, native) if absolute is None else None
+                    if absolute is not None:
+                        if absolute.detail:
+                            raise ValueError(absolute.detail)
+                        if (native["section"] != 0 or native["storage"] != 2
+                                or native["type"] != 0 or native["value"] or native["aux_count"]
+                                or sum(record["name"] == name for record in coff.symbols.values()) != 1):
+                            raise ValueError(f"Absolute scalar needs one unaliased type-0 external reference: {name}")
+                        if (inferred != absolute.value or any(
+                                record.va != absolute.value or record.is_function
+                                for record in symbols if record.symbol == name)):
+                            raise ValueError(f"Actual relocation or MAP conflicts with absolute provider: {name}")
+                        target = absolute.value
+                        closure.provenance.append(
+                            f"{owner}:{node.name}+{offset:#x} {'REL32' if kind == 20 else 'DIR32'} "
+                            f"index={index} addend={addend:#x} -> ABS {name} at {target:#010x}; "
+                            f"{absolute.provenance}")
+                    elif target_map is not None:
                         if inferred != target_map.va:
                             raise ValueError(f"Actual relocation conflicts with MAP target: {name}")
                         expected_function = (by_symbol[name][0].kind != "data" if name in by_symbol

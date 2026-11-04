@@ -8,7 +8,7 @@ from binary_comp.analyzers.coff_report import (
     ordinary_entries, region_context, register_external_bindings, validate_counted_code,
 )
 from binary_comp.analyzers.exe import linked_map_identity
-from binary_comp.analyzers.coff_linked_graph import resolve_private_placements
+from binary_comp.analyzers.coff_linked_graph import load_absolute_definitions, resolve_private_placements
 from binary_comp.config import ConfigError
 from binary_comp.core.coff import data_check_only_size, is_function_type, validate_data_binding
 from binary_comp.core.mapfile import parse_msvc_map_symbols
@@ -91,6 +91,7 @@ def compare_linked_data(target, modules, *, allow_empty=False):
     original, _ = load_reference(target, target.name)
     rebuilt = FileBackedPEImage(target.rebuilt_exe)
     symbols = parse_msvc_map_symbols(target.map_path)
+    absolutes = load_absolute_definitions(target)
     rows, externals = [], {}
     for module in modules:
         bindings = _code_bindings(module.get("bindings", {}).get(target.name, {}),
@@ -176,7 +177,8 @@ def compare_linked_data(target, modules, *, allow_empty=False):
             context = region_context(coff, module, target.name, bindings, original, providers)
             placements = resolve_private_placements(
                 coff, module, target.name, bindings, original, rebuilt, symbols,
-                validated_data, providers=providers, regions=context, read_window=data_window)
+                validated_data, providers=providers, regions=context, read_window=data_window,
+                absolute_definitions=absolutes)
             for index, row in enumerate(module_rows):
                 proof = placements.get(row.symbol)
                 if row.status != "missing" or row.contract_status != "validated" or proof is None:

@@ -56,6 +56,7 @@ class ProjectTarget:
     original_sha256: str | None = None
     object_dir: str | None = None
     object_dirs: tuple[str, ...] = ()
+    absolute_definitions: tuple[tuple[str, str], ...] = ()
 
 
 def load_json(path: str | os.PathLike[str] | None) -> dict[str, Any]:
@@ -205,6 +206,19 @@ def _object_dirs(config: dict[str, Any], base: Path) -> tuple[str, ...]:
     return _resolve_standalone_paths(tuple(directories), base)
 
 
+def _absolute_definitions(config: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    definitions = config.get("absolute_definitions", {})
+    if not isinstance(definitions, dict):
+        raise ConfigError("absolute_definitions must map native names to object basenames")
+    for name, filename in definitions.items():
+        if not isinstance(name, str) or not name:
+            raise ConfigError("absolute_definitions needs nonempty native names")
+        if (not isinstance(filename, str) or not filename.lower().endswith(".obj")
+                or any(character in filename for character in "/\\:")):
+            raise ConfigError("absolute_definitions provider must be an .obj basename")
+    return tuple(definitions.items())
+
+
 def _build_config(config: dict[str, Any], inherited_jobs: int = 1) -> BuildConfig:
     build = config.get("build", {})
     if build is None:
@@ -310,6 +324,7 @@ def _target_from_standalone(config: dict[str, Any], target: str, base: Path) -> 
         original_sha256=optional_string(target_cfg, "original_sha256"),
         object_dir=_resolve_standalone_path(optional_string(target_cfg, "object_dir"), base),
         object_dirs=_object_dirs(target_cfg, base),
+        absolute_definitions=_absolute_definitions(target_cfg),
     )
 
 

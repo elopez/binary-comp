@@ -453,6 +453,24 @@ native source contracts and relocation edges. Other missing symbols remain
 unresolved: the command neither scans bytes nor estimates addresses or lengths
 from neighboring MAP entries, and original addresses never seed actual placement.
 
+An `i386-coff` target can explicitly supply linker absolute scalar definitions:
+
+```json
+"absolute_definitions": {"_constant": "Constants.obj"}
+```
+
+Provider basenames use that target's existing `object_dir`/`object_dirs` lookup.
+Each selected name needs exactly one strong external, type-0, auxiliary-free
+`IMAGE_SYM_ABSOLUTE` record in its provider object. Its actual unsigned COFF value
+(including zero) supplies a fixed terminal for an unaliased type-0 undefined
+external reference. Actual operands must reproduce the provider value with the
+source's real relocation and addend; original address bindings do not supply the
+constant. Conflicting configured provider definitions or MAP values/function
+roles reject the proof. Missing or invalid providers stay unresolved diagnostics.
+Provenance includes the provider path, object digest, symbol index and native
+absolute value. These definitions supply no graph roots, data rows, allocation
+claims or raw equality credit of their own.
+
 Placement and raw equality are independent: a shifted window can contain the
 same bytes. Both complete configured windows must lie in a single unambiguous
 PE section and be fully file-backed. Virtual zero-fill and mixed file/zero-fill
