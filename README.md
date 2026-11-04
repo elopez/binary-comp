@@ -428,8 +428,30 @@ owner only after proving a real external native data definition (class 2).
 Static, weak, undefined and metadata records cannot authorize that fallback.
 Explicit validated strong COMMON providers use their own object identity;
 sectionless COMMON requests alone prove no linked allocation and earn no raw
-equality credit. Missing private symbols remain unresolved: the command neither
-scans bytes nor estimates addresses or lengths from neighboring MAP entries.
+equality credit.
+
+Missing private placements can also be established by an actual, object-qualified
+COFF relocation graph. Its roots must be complete validated native code, region
+or data contracts with unique same-owner external definitions under `Publics by
+Value`. Only real in-bounds, nonoverlapping i386 DIR32/REL32 records are followed,
+using their exact native symbol indices and addends. Every traversed private code
+label, function, region or data definition needs its own complete strict native
+contract. Derived addresses stay tentative until all source windows in the
+anchored component replay exactly from the COFF bytes with every relocation
+resolved. Known PUBLIC MAP targets are fixed terminals; their values cannot be
+replaced by an inferred address. Conflicting roots or paths, incomplete contracts,
+weak/undefined private aliases, unsupported edges, overlapping windows and failed
+source bytes leave the component unresolved. Shared public extern targets do not
+connect otherwise independent components.
+
+Graph source windows must be fully file-backed. Native uninitialized data may be
+a target but never a source; the actual PE window's backing still controls raw
+comparison credit. Foreign selected definitions and COMMON providers cannot
+supply graph source roots. Retained layout owners lacking an explicit code role
+also stay outside graph source proofs. Provenance records the exact MAP root,
+native source contracts and relocation edges. Other missing symbols remain
+unresolved: the command neither scans bytes nor estimates addresses or lengths
+from neighboring MAP entries, and original addresses never seed actual placement.
 
 Placement and raw equality are independent: a shifted window can contain the
 same bytes. Both complete configured windows must lie in a single unambiguous
@@ -442,7 +464,8 @@ counts, linked allocation extents, behavior or whole-file equality.
 `--target all` finishes every selected target's diagnostic, and `--module` can
 select native modules. `--output` writes `report.json` and `report.txt`, with
 addresses, native owner offsets, full MAP identities, backing categories,
-object proof/fixups, placement and raw equality, and exact compared byte counts.
+object proof/fixups, placement and raw equality, exact compared byte counts, and
+relocation graph provenance when used (`--verbose` includes the proof in text).
 `--verbose` includes object-contract failure details. Exit status is 0 only when
 all selected windows have validated contracts, original placement and raw-equal
 file bytes; diagnostic differences or unresolved windows return 1, and malformed

@@ -8,6 +8,7 @@ from binary_comp.analyzers.coff_report import (
     ordinary_entries, region_context, register_external_bindings, validate_counted_code,
 )
 from binary_comp.analyzers.exe import linked_map_identity
+from binary_comp.analyzers.coff_linked_graph import resolve_private_placements
 from binary_comp.config import ConfigError
 from binary_comp.core.coff import data_check_only_size, is_function_type, validate_data_binding
 from binary_comp.core.mapfile import parse_msvc_map_symbols
@@ -36,6 +37,8 @@ class LinkedDataRow:
     compared_size: int = 0
     status: str = "missing"
     detail: str = ""
+    resolution: str = ""
+    resolution_provenance: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,8 @@ class LinkedDataSummary:
 
 def data_window(image, address, size):
     """Classify one complete interval; virtual zeros never become raw bytes."""
+    if not 0 <= address < address + size <= 0x100000000:
+        return "invalid-window", None
     sections = [section for section in image.sections
                 if section.start < address + size and address < section.end]
     if len(sections) != 1 or not sections[0].start <= address < address + size <= sections[0].end:
@@ -60,6 +65,20 @@ def data_window(image, address, size):
     if address + size > raw_end:
         return "mixed-file-zero-fill", None
     return "file-backed", image.read(address, size)
+
+
+def _compare_window(row, original, rebuilt):
+    _, original_data = data_window(original, row.original_address, row.size)
+    backing, rebuilt_data = data_window(rebuilt, row.rebuilt_address, row.size)
+    row = replace(row, rebuilt_backing=backing)
+    if row.contract_status != "validated":
+        return replace(row, status=row.contract_status)
+    if original_data is None or rebuilt_data is None:
+        return replace(row, status="non-file-backed-window")
+    equal = original_data == rebuilt_data
+    return replace(row, raw_equal=equal, compared_size=row.size,
+                   matching_bytes=sum(a == b for a, b in zip(original_data, rebuilt_data)),
+                   status="raw-equal" if equal else "raw-different")
 
 
 def compare_linked_data(target, modules, *, allow_empty=False):
@@ -81,6 +100,7 @@ def compare_linked_data(target, modules, *, allow_empty=False):
                     and data_check_only_size(name, binding) is None]
         if not selected:
             continue
+        module_rows, validated_data = [], {}
         coff = load_object(module, target)
         providers, _ = load_common_definitions(module, target, target.name)
         register_external_bindings(externals, coff, bindings, target.name, module["name"])
@@ -95,7 +115,7 @@ def compare_linked_data(target, modules, *, allow_empty=False):
                 raise ConfigError(f"Invalid complete data extent: {name}")
             owner = module["name"] + ".obj"
             row = LinkedDataRow(module["name"], name, int(binding["va"], 16), size, owner)
-            backing, original_data = data_window(original, row.original_address, size)
+            backing, _ = data_window(original, row.original_address, size)
             row = replace(row, original_backing=backing)
             definition = None
             try:
@@ -103,8 +123,8 @@ def compare_linked_data(target, modules, *, allow_empty=False):
                 native = coff
                 if common is not None:
                     if name not in providers:
-                        rows.append(replace(row, contract_status="common-request", status="common-request",
-                                            detail="Sectionless COMMON request does not prove linked allocation"))
+                        module_rows.append(replace(row, contract_status="common-request", status="common-request",
+                                                   detail="Sectionless COMMON request does not prove linked allocation"))
                         continue
                     native = providers[name]
                     owner = module["common_definitions"][target.name][name]
@@ -127,6 +147,8 @@ def compare_linked_data(target, modules, *, allow_empty=False):
                 _, fixups = validate_data_binding(coff, name, bindings, original,
                                                   common_definitions=providers, code_regions=context)
                 row = replace(row, contract_status="validated", checked_fixups=fixups)
+                if native is coff:
+                    validated_data[name] = size, fixups
             except KeyError:
                 row = replace(row, detail="No owned native data definition")
             except ValueError as error:
@@ -139,27 +161,35 @@ def compare_linked_data(target, modules, *, allow_empty=False):
                 candidates = {linked_map_identity(symbol): symbol for symbol in matching
                               if symbol.visibility == "public" and not symbol.is_function}
             if len(candidates) != 1:
-                rows.append(replace(row, status="ambiguous" if candidates else "missing"))
+                module_rows.append(replace(row, status="ambiguous" if candidates else "missing"))
                 continue
             mapped = next(iter(candidates.values()))
             row = replace(row, rebuilt_address=mapped.va,
                           map_object=mapped.object_file,
-                          placement_equal=mapped.va == row.original_address)
+                          placement_equal=mapped.va == row.original_address, resolution="map")
             if mapped.is_function:
-                rows.append(replace(row, status="not-data"))
+                module_rows.append(replace(row, status="not-data"))
                 continue
-            backing, rebuilt_data = data_window(rebuilt, mapped.va, size)
-            row = replace(row, rebuilt_backing=backing)
-            if row.contract_status != "validated":
-                rows.append(replace(row, status=row.contract_status))
-            elif original_data is None or rebuilt_data is None:
-                rows.append(replace(row, status="non-file-backed-window"))
-            else:
-                equal = original_data == rebuilt_data
-                rows.append(replace(row, raw_equal=equal,
-                                    compared_size=size,
-                                    matching_bytes=sum(a == b for a, b in zip(original_data, rebuilt_data)),
-                                    status="raw-equal" if equal else "raw-different"))
+            module_rows.append(_compare_window(row, original, rebuilt))
+        if any(row.status == "missing" and row.contract_status == "validated"
+               and row.symbol in validated_data for row in module_rows):
+            context = region_context(coff, module, target.name, bindings, original, providers)
+            placements = resolve_private_placements(
+                coff, module, target.name, bindings, original, rebuilt, symbols,
+                validated_data, providers=providers, regions=context, read_window=data_window)
+            for index, row in enumerate(module_rows):
+                proof = placements.get(row.symbol)
+                if row.status != "missing" or row.contract_status != "validated" or proof is None:
+                    continue
+                if proof.address is None:
+                    module_rows[index] = replace(row, detail=proof.detail)
+                else:
+                    row = replace(row, rebuilt_address=proof.address,
+                                  placement_equal=proof.address == row.original_address,
+                                  resolution="relocation-graph",
+                                  resolution_provenance=proof.provenance)
+                    module_rows[index] = _compare_window(row, original, rebuilt)
+        rows.extend(module_rows)
     if not rows and not allow_empty:
         raise ConfigError("No complete owned COFF data contracts selected")
     return LinkedDataSummary(tuple(rows))
@@ -191,6 +221,10 @@ def format_linked_data(summary, *, verbose=False):
                      f"backing={row.original_backing}/{row.rebuilt_backing}")
         if row.map_object:
             lines.append(f"    MAP identity: {row.map_object}")
+        if row.resolution == "relocation-graph":
+            lines.append("    Placement: validated actual COFF relocation graph")
+        if verbose:
+            lines.extend(f"    {line}" for line in row.resolution_provenance)
         if verbose and row.detail:
             lines.append(f"    {row.detail}")
     return "\n".join(lines)
