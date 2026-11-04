@@ -10,9 +10,12 @@ from binary_comp.analyzers import exe
 from binary_comp.analyzers.coff_report import load_selection
 from binary_comp.cli import main
 from conftest import TEXT_VA, write_tiny_pe
+from test_coff_contract import coff_bytes
 
 
 CODE = bytes.fromhex("b8 11 22 33 44 c3")
+INLINE = "?read@InlineValue@@QBEHXZ"
+PUBLIC_HEADER = "  Address         Publics by Value              Rva+Base       Lib:Object\n\n"
 
 
 def map_line(symbol="_answer", address=TEXT_VA, obj="Sample.obj", flag="f", segment=1):
@@ -70,6 +73,24 @@ def compare(project, **options):
 def run(project, *, functions=True):
     args = ["exe", "--config", str(project["config"]), "--target", "retail"]
     return main(args + (["--functions"] if functions else []))
+
+
+def native_object(project, symbols=None, *, code=CODE, flags=0x60000020):
+    directory = project["config"].parent / "not-built"
+    directory.mkdir(exist_ok=True)
+    path = directory / "Sample.obj"
+    if symbols is None:
+        symbols = [{"name": INLINE, "section": 1, "type": 0x20}]
+    path.write_bytes(coff_bytes([{"data": code, "flags": flags}], symbols))
+    return path
+
+
+@pytest.fixture
+def external_inline(project):
+    native_object(project)
+    write_json(project["manifest"], [{"name": "Sample", "functions": [function(INLINE)]}])
+    project["map"].write_text(PUBLIC_HEADER + map_line(INLINE, obj="Other.obj"))
+    return project
 
 
 def test_complete_raw_windows_need_no_source_parser_or_built_objects(project, monkeypatch, capsys):
@@ -283,3 +304,112 @@ def test_invalid_or_incomplete_original_extents_fail_the_cli(project, extent, ca
     write_json(project["manifest"], [{"name": "Sample", "functions": [entry]}])
     assert run(project) == 2
     assert "error:" in capsys.readouterr().err
+
+
+def test_public_selected_definition_can_come_from_another_object(external_inline):
+    row, = compare(external_inline).linked_functions.rows
+    assert row.raw_equal is True
+    assert row.rebuilt_addr == TEXT_VA
+    assert "exact external function defined in sample.obj" in row.detail
+    assert "selected Other.obj" in row.detail
+
+
+def test_owned_identity_takes_precedence_without_opening_object(external_inline, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise AssertionError("Owned MAP resolution must not open an object")
+
+    external_inline["map"].write_text(PUBLIC_HEADER + map_line(INLINE, obj="Sample.obj")
+                                      + map_line(INLINE, TEXT_VA + 16, "Other.obj"))
+    monkeypatch.setattr("binary_comp.analyzers.coff_report.load_object", unavailable)
+    row, = compare(external_inline).linked_functions.rows
+    assert row.raw_equal is True
+    assert row.rebuilt_addr == TEXT_VA
+    assert row.detail == ""
+
+
+@pytest.mark.parametrize("record", [
+    {"storage": 3},  # A private function cannot borrow a same-named public function.
+    {"section": 0},
+    {"type": 0},
+    {"storage": 6},
+    {"value": len(CODE)},
+    {"name": "?other@InlineValue@@QBEHXZ"},
+])
+def test_public_fallback_needs_exact_defined_external_function(external_inline, record):
+    symbol = {"name": INLINE, "section": 1, "type": 0x20, **record}
+    native_object(external_inline, [symbol])
+    row, = compare(external_inline).linked_functions.rows
+    assert row.status == "missing"
+    assert row.raw_equal is None
+    assert row.rebuilt_addr is None
+    assert "external proof failed" in row.detail
+
+
+def test_weak_fallback_to_an_external_function_does_not_prove_requested_name(external_inline):
+    native_object(external_inline, [
+        {"name": INLINE, "storage": 105, "type": 0x20,
+         "aux": struct.pack("<II10x", 2, 3)},
+        {"name": "?other@InlineValue@@QBEHXZ", "section": 1, "type": 0x20},
+    ])
+    row, = compare(external_inline).linked_functions.rows
+    assert row.status == "missing"
+    assert row.raw_equal is None
+    assert "Undefined symbol" in row.detail
+
+
+@pytest.mark.parametrize("failure", ["missing", "malformed", "non-executable"])
+def test_unavailable_native_linkage_proof_stays_diagnostic(external_inline, failure, capsys):
+    path = external_inline["config"].parent / "not-built" / "Sample.obj"
+    if failure == "missing":
+        path.unlink()
+    elif failure == "malformed":
+        path.write_bytes(b"invalid")
+    else:
+        native_object(external_inline, flags=0x40000040)
+    row, = compare(external_inline).linked_functions.rows
+    assert row.status == "missing"
+    assert row.raw_equal is None
+    assert "external proof failed" in row.detail
+    assert run(external_inline) == 0
+    assert "Raw-equal configured windows: 0/1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("prefix", [
+    "", "Static symbols\n", "Address Unknown symbols Rva+Base Lib:Object\n",
+    PUBLIC_HEADER + map_line("_unrelated", obj="Other.obj") + "Static symbols\n",
+    PUBLIC_HEADER + map_line("_unrelated", obj="Other.obj") + "Address Unknown symbols\n",
+    "Address Static symbols Rva+Base Lib:Object\n",
+])
+def test_unknown_or_static_map_rows_cannot_supply_public_fallback(external_inline, prefix, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise AssertionError("No PUBLIC candidate should require native proof")
+
+    external_inline["map"].write_text(prefix + map_line(INLINE, obj="Other.obj"))
+    monkeypatch.setattr("binary_comp.analyzers.coff_report.load_object", unavailable)
+    row, = compare(external_inline).linked_functions.rows
+    assert row.status == "missing"
+    assert row.raw_equal is None
+
+
+@pytest.mark.parametrize("second_address", [TEXT_VA, TEXT_VA + 16])
+def test_multiple_public_identities_remain_ambiguous(external_inline, second_address):
+    external_inline["map"].write_text(PUBLIC_HEADER + map_line(INLINE, obj="Other.obj")
+                                      + map_line(INLINE, second_address, "Third.obj"))
+    row, = compare(external_inline).linked_functions.rows
+    assert row.status == "ambiguous"
+    assert row.raw_equal is None
+    assert row.rebuilt_addr is None
+
+
+def test_public_linkage_proof_does_not_establish_coff_body_equality(external_inline):
+    native_object(external_inline, code=b"\xc3")
+    row, = compare(external_inline).linked_functions.rows
+    assert row.raw_equal is True
+    assert row.compared_size == len(CODE)
+
+
+def test_public_fallback_still_compares_exact_raw_operands(external_inline):
+    write_tiny_pe(external_inline["rebuilt"], bytes.fromhex("b8 11 22 33 55 c3"))
+    row, = compare(external_inline).linked_functions.rows
+    assert row.raw_equal is False
+    assert row.matching_bytes == len(CODE) - 1

@@ -24,13 +24,14 @@ class EncodedAddressMapEntry:
 
 @dataclass(frozen=True)
 class MapSymbol:
-    """A single ``segment:offset symbol va [f] [object]`` map line."""
+    """A map line, with optional public/static provenance from an MSVC heading."""
 
     segment: int
     va: int
     symbol: str
     is_function: bool
     object_file: str | None
+    visibility: str | None = None
 
 
 FUNCTION_LINE_RE = re.compile(
@@ -84,9 +85,18 @@ def parse_msvc_map_symbols(map_path: str) -> list[MapSymbol]:
         return symbols
 
     with open(map_path, "r", encoding="latin1", errors="ignore") as f:
+        visibility = None
         for line in f:
+            if re.match(r"^\s*Address\s+Publics by Value(?:\s|$)", line, re.IGNORECASE):
+                visibility = "public"
+                continue
+            if re.match(r"^\s*(?:Static symbols\s*$|Address\s+Static symbols(?:\s|$))", line, re.IGNORECASE):
+                visibility = "static"
+                continue
             match = ANY_SEGMENT_SYMBOL_LINE_RE.match(line)
             if not match:
+                if line.strip():
+                    visibility = None
                 continue
             tail = match.group("rest").strip()
             rest = tail.split()
@@ -103,6 +113,7 @@ def parse_msvc_map_symbols(map_path: str) -> list[MapSymbol]:
                 symbol=match.group("symbol"),
                 is_function=bool(rest) and rest[0] == "f",
                 object_file=object_file,
+                visibility=visibility,
             ))
 
     symbols.sort(key=lambda entry: (entry.va, entry.symbol))

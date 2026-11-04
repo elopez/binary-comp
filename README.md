@@ -375,20 +375,29 @@ binary-comp exe --config binary-comp.json --target retail --functions
 
 This diagnostic authenticates the original image's SHA-256 and compares each
 selected `functions` entry's full configured extent with the same-sized window
-at its linked MAP address. It requires an exact decorated symbol and a unique
-object-member identity matching `<module name>.obj`; object names ignore case,
-Windows directory separators and library prefixes when selecting the member.
+at its linked MAP address. It first looks for an exact decorated symbol and a
+unique object-member identity matching `<module name>.obj`. Member selection
+ignores case, Windows directory separators and library prefixes.
 Distinct full object paths or library identities with that member name remain
 ambiguous. Repeated identical MAP records are deduplicated, and separate function
-symbols may share a linked address. Missing, ambiguous or untyped MAP entries
-receive no equality credit. Both windows must be executable and entirely backed
+symbols may share a linked address. If that owner has no matching MAP entry,
+the diagnostic may read its configured COFF object to prove the exact symbol is
+a defined, typed external function (storage class 2) in executable code. Only
+then can a unique exact function entry under `Publics by Value` select another
+object's definition, as with linker-selected inline or identical COMDAT code.
+Static or unknown MAP tables cannot supply this fallback, and native static,
+undefined, weak or untyped symbols cannot authorize it. Missing proof objects
+leave an unresolved diagnostic row. This linkage proof does not compare the
+object's body or establish its extent. Missing, ambiguous or untyped MAP entries
+receive no equality credit. Both PE windows must be executable and entirely backed
 by file bytes. No window is shortened at another MAP symbol or a size cap, and
 no relocation operands are corrected or masked.
 
 The `Configured linked RAW windows` report counts only explicit `functions`;
 `code_labels`, `code_regions` and address-only bindings add no rows. It reads no
-objects or C++ sources and invokes no build, so the configured object directories
-need not contain built files. Linked-window equality does not verify source or
+C++ sources and invokes no build. Normal object-scoped MAP matches require no
+object reads; cross-object PUBLIC resolution needs the canonical object for
+native linkage proof. Linked-window equality does not verify source or
 COFF equality, linked function extents, behavior or whole-file equality. Use the
 strict COFF report separately for native source-contribution verification. As
 with the existing `exe` report, differences are diagnostic; input and validation
@@ -882,7 +891,7 @@ original addresses for external function-pointer initializers. The `data`
 
 | Analyzer | Required target fields | Extra notes |
 | --- | --- | --- |
-| `exe` | `original_exe`, `rebuilt_exe`; legacy function mapping also needs `map`, `source_dirs` | Legacy `--functions` uses source annotations and supports `library_ranges`. An `i386-coff` target authenticates `original_sha256`; `--functions` reuses `coff.modules` and `map` for full configured linked RAW windows without source parsing or object reads. |
+| `exe` | `original_exe`, `rebuilt_exe`; legacy function mapping also needs `map`, `source_dirs` | Legacy `--functions` uses source annotations and supports `library_ranges`. An `i386-coff` target authenticates `original_sha256`; `--functions` reuses `coff.modules` and `map` for full configured linked RAW windows without source parsing. Cross-object PUBLIC resolution additionally needs native external-linkage proof from the canonical object. |
 | `export-asm` | `original_exe`, `code_export_dir` | Generates Ghidra-style `FUN_*.disassembled.txt` exports with Capstone. Source annotations and an original map are optional boundary inputs; existing Ghidra exports remain compatible. |
 | `compare` | `original_exe`, `rebuilt_exe`, `map`, `source_dirs` | Also takes one Ghidra-style `FUN_*.disassembled.txt` path. |
 | `report` | `original_exe`, `rebuilt_exe`, `map`, `source_dirs`, `code_export_dir` | Uses one export per annotated original address. Generate them with `export-asm` or Ghidra. |

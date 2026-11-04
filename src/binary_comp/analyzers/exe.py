@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from binary_comp.config import ConfigError, ProjectTarget
+from binary_comp.core.coff import is_function_type
 from binary_comp.core.mapfile import function_starts_from_map, parse_msvc_map_by_obj, parse_msvc_map_symbols
 from binary_comp.core.pe import EXECUTABLE_FLAG, FileBackedPEImage, PEImage, Section
 from binary_comp.source.functions import load_source_groups, map_source_groups, object_member_name
@@ -342,6 +343,34 @@ def executable_window(image: FileBackedPEImage, address: int, size: int) -> byte
     return image.read(address, size)
 
 
+def linked_map_identity(symbol):
+    return (symbol.segment, symbol.va, symbol.is_function,
+            symbol.object_file.replace("\\", "/").casefold())
+
+
+def prove_external_function(module, target, name, objects):
+    """Prove exact native linkage, without following weak aliases or comparing code."""
+    from binary_comp.analyzers.coff_report import load_object
+
+    owner = module["name"]
+    if owner not in objects:
+        try:
+            objects[owner] = load_object(module, target)
+        except (OSError, ConfigError, ValueError) as error:
+            objects[owner] = error
+    coff = objects[owner]
+    if isinstance(coff, Exception):
+        raise ValueError(str(coff))
+    try:
+        symbol, section = coff.definition(name)
+    except KeyError as error:
+        raise ValueError(f"COFF symbol is not defined: {name}") from error
+    if (symbol["storage"] != 2 or not is_function_type(symbol["type"])
+            or not section["flags"] & 0x20 or not section["flags"] & EXECUTABLE_FLAG
+            or not 0 <= symbol["value"] < len(section["data"])):
+        raise ValueError(f"COFF symbol is not a defined external function: {name}")
+
+
 def compare_linked_functions(
     target: ProjectTarget,
     original: FileBackedPEImage,
@@ -356,6 +385,7 @@ def compare_linked_functions(
         raise FileNotFoundError(f"MSVC MAP not found: {target.map_path}")
     symbols = parse_msvc_map_symbols(target.map_path)
     rows = []
+    objects = {}
     for module in modules:
         member = (module["name"] + ".obj").casefold()
         for function in module.get("functions", []):
@@ -369,21 +399,29 @@ def compare_linked_functions(
             original_data = executable_window(original, row.original_addr, row.configured_size)
             # Preserve full object provenance: two members with the same basename
             # do not become one identity, even if their linked VAs coincide.
-            candidates = {}
-            for symbol in symbols:
-                if (symbol.symbol != row.symbol or symbol.object_file is None
-                        or object_member_name(symbol.object_file).casefold() != member):
-                    continue
-                identity = (symbol.segment, symbol.va, symbol.is_function,
-                            symbol.object_file.replace("\\", "/").casefold())
-                candidates.setdefault(identity, symbol)
+            matching = [symbol for symbol in symbols
+                        if symbol.symbol == row.symbol and symbol.object_file is not None]
+            candidates = {linked_map_identity(symbol): symbol for symbol in matching
+                          if object_member_name(symbol.object_file).casefold() == member}
             if not candidates:
-                rows.append(replace(row, detail=f"No MAP identity in {member}"))
-                continue
+                public = {linked_map_identity(symbol): symbol for symbol in matching
+                          if symbol.visibility == "public" and symbol.is_function}
+                if not public:
+                    rows.append(replace(row, detail=f"No MAP identity in {member} or exact PUBLIC function"))
+                    continue
+                try:
+                    prove_external_function(module, target, row.symbol, objects)
+                except ValueError as error:
+                    rows.append(replace(row, detail=f"No MAP identity in {member}; external proof failed: {error}"))
+                    continue
+                candidates = public
+                row = replace(row, detail=f"PUBLIC MAP identity; exact external function defined in {member}")
             if len(candidates) != 1:
-                rows.append(replace(row, status="ambiguous", detail=f"Multiple MAP identities in {member}"))
+                rows.append(replace(row, status="ambiguous", detail="Multiple matching MAP identities"))
                 continue
             symbol = next(iter(candidates.values()))
+            if row.detail:
+                row = replace(row, detail=f"{row.detail}; selected {symbol.object_file}")
             row = replace(row, rebuilt_addr=symbol.va)
             if not symbol.is_function:
                 rows.append(replace(row, status="not-function", detail="MAP entry has no f flag"))
