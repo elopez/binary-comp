@@ -191,6 +191,19 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
     def unique_map(name, native):
         # Owned identities take precedence, as in the direct linked diagnostic.
         candidates = _map_candidates(symbols, name, owner)
+        dlls = [record for record in symbols if record.symbol == name
+                and record.visibility == "public" and record.dll_contributor is not None]
+        if dlls and native["storage"] == 2:
+            if (native["section"] != 0 or native["value"] or native["aux_count"]
+                    or native["type"] != 0 and not is_function_type(native["type"])
+                    or sum(record["name"] == name for record in coff.symbols.values()) != 1):
+                raise ValueError(f"DLL terminal needs one strong unaliased undefined external: {name}")
+            # DLL terminals have no local ownership precedence. Every qualified
+            # PUBLIC object/DLL identity for this exact extern must be unique.
+            public = [record for record in symbols if record.symbol == name and record.visibility == "public"]
+            if any(record.object_file is None and record.dll_contributor is None for record in public):
+                raise ValueError(f"Ambiguous actual MAP target with unqualified PUBLIC provenance: {name}")
+            candidates = {linked_map_identity(record): record for record in public}
         if not candidates and native["storage"] == 2:
             candidates = _map_candidates(symbols, name, owner, public=True)
         if len(candidates) > 1:
@@ -224,6 +237,28 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                 or not reference.section_for_va(node.original).flags & 0x20000000):
             raise ValueError(f"Complete code source is not executable: {node.name}")
         return payload
+
+    def map_target_role(name, native, mapped, kind):
+        # i386 import-pointer names carry function type in COFF, while the
+        # qualified DLL MAP row identifies a scalar slot. This ABI prefix
+        # classifies only the role; the address always comes from that MAP row.
+        import_slot = (mapped.dll_contributor is not None and native["section"] == 0
+                       and is_function_type(native["type"])
+                       and name.startswith("__imp_") and len(name) > len("__imp_"))
+        if import_slot:
+            if kind != 6 or mapped.is_function or read_window(rebuilt, mapped.va, 4)[0] != "file-backed":
+                raise ValueError(f"DLL import-slot role needs DIR32 and a file-backed non-function 4-byte terminal: {name}")
+        if import_slot:
+            expected = False
+        elif name in by_symbol:
+            expected = by_symbol[name][0].kind != "data"
+        elif native["section"] > 0 or is_function_type(native["type"]):
+            expected = is_function_type(native["type"])
+        else:
+            expected = None
+        if expected is not None and mapped.is_function != expected:
+            raise ValueError(f"Actual MAP target role differs: {name}")
+        return import_slot
 
     def validate_windows(addresses):
         used = [(nodes[name], placement) for name, placement in addresses.items()]
@@ -259,6 +294,8 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                 name = native["name"]
                 try:
                     mapped = unique_map(name, native)
+                    if mapped is not None and native["storage"] == 2 and mapped.visibility == "public":
+                        map_target_role(name, native, mapped, kind)
                 except ValueError:
                     mapped = None
                 if (native["storage"] == 2 and mapped is not None
@@ -332,19 +369,17 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                     elif target_map is not None:
                         if inferred != target_map.va:
                             raise ValueError(f"Actual relocation conflicts with MAP target: {name}")
-                        expected_function = (by_symbol[name][0].kind != "data" if name in by_symbol
-                                             else is_function_type(native["type"])
-                                             if native["section"] > 0 or is_function_type(native["type"]) else None)
-                        if expected_function is not None and target_map.is_function != expected_function:
-                            raise ValueError(f"Actual MAP target role differs: {name}")
+                        import_slot = map_target_role(name, native, target_map, kind)
                         if target_map.visibility == "public" and native["storage"] == 2:
                             # Exact PUBLIC addresses are terminals. A foreign
                             # selected owner never authenticates a local source.
                             target = target_map.va
+                            provenance = target_map.object_file or (
+                                ("DLL import-slot " if import_slot else "DLL ") + target_map.dll_contributor)
                             closure.provenance.append(
                                 f"{owner}:{node.name}+{offset:#x} {'REL32' if kind == 20 else 'DIR32'} "
                                 f"index={index} addend={addend:#x} -> PUBLIC {name} "
-                                f"at {target:#010x} from {target_map.object_file}")
+                                f"at {target:#010x} from {provenance}")
                         else:
                             target = None
                     else:

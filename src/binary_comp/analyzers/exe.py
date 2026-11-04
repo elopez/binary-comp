@@ -344,8 +344,12 @@ def executable_window(image: FileBackedPEImage, address: int, size: int) -> byte
 
 
 def linked_map_identity(symbol):
+    kind = "object" if symbol.object_file is not None else "dll"
+    contributor = symbol.object_file if symbol.object_file is not None else symbol.dll_contributor
+    if contributor is None:
+        raise ValueError("MAP identity needs explicit object or DLL provenance")
     return (symbol.segment, symbol.va, symbol.is_function,
-            symbol.object_file.replace("\\", "/").casefold())
+            kind, contributor.replace("\\", "/").casefold())
 
 
 def prove_external_function(module, target, name, objects):

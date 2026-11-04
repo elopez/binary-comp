@@ -453,6 +453,25 @@ native source contracts and relocation edges. Other missing symbols remain
 unresolved: the command neither scans bytes nor estimates addresses or lengths
 from neighboring MAP entries, and original addresses never seed actual placement.
 
+Exact PUBLIC DLL contributors in basename form `Support:Helpers.dll` (optionally
+with `.lib` on the library name) can also supply fixed terminals for strong,
+single-record undefined externs. DLL provenance stays separate from native
+object ownership and never supplies graph roots or direct data coverage. The
+complete contributor identity must be unique across same-name PUBLIC object/DLL
+records; unqualified competing PUBLIC records also reject the proof. Static,
+ownerless, malformed and aliased records cannot supply DLL terminals. Native
+type 0 leaves the MAP role authoritative; positive function types require `f`.
+
+The bounded i386 import-pointer ABI role is an exception to that function flag:
+a typed undefined `__imp_` symbol with a nonempty suffix and qualified PUBLIC DLL
+provenance requires a DIR32 edge, no `f`, and a complete, unambiguous file-backed
+4-byte terminal at the actual MAP VA. The prefix classifies the import-slot role
+only; it never supplies an address. All source bytes and real addends still need
+the complete relocation replay. Provenance labels these as DLL import-slot
+placements. These checks trust the caller's actual MAP; they do not validate PE
+import directories, runtime DLL binding, slot allocation extents or import-slot
+raw equality.
+
 An `i386-coff` target can explicitly supply linker absolute scalar definitions:
 
 ```json

@@ -24,7 +24,7 @@ class EncodedAddressMapEntry:
 
 @dataclass(frozen=True)
 class MapSymbol:
-    """A map line, with optional public/static provenance from an MSVC heading."""
+    """A MAP line with separate object/DLL contributor and heading provenance."""
 
     segment: int
     va: int
@@ -32,6 +32,7 @@ class MapSymbol:
     is_function: bool
     object_file: str | None
     visibility: str | None = None
+    dll_contributor: str | None = None
 
 
 FUNCTION_LINE_RE = re.compile(
@@ -45,6 +46,10 @@ ENCODED_ADDRESS_SUFFIX_RE = re.compile(
 )
 ANY_SEGMENT_SYMBOL_LINE_RE = re.compile(
     r"^\s*(?P<segment>[0-9a-fA-F]{4}):[0-9a-fA-F]+\s+(?P<symbol>\S+)\s+(?P<va>[0-9a-fA-F]{8})(?P<rest>.*)$"
+)
+DLL_CONTRIBUTOR_RE = re.compile(
+    r"[A-Za-z0-9_$-][A-Za-z0-9_$.-]*:[A-Za-z0-9_$-][A-Za-z0-9_$.-]*\.dll",
+    re.IGNORECASE,
 )
 
 
@@ -105,6 +110,7 @@ def parse_msvc_map_symbols(map_path: str) -> list[MapSymbol]:
             object_file = re.sub(r"^(?:f(?:\s+|$))?(?:i(?:\s+|$))?", "", tail)
             if object_file.startswith('"') and object_file.endswith('"'):
                 object_file = object_file[1:-1]
+            dll_contributor = object_file if DLL_CONTRIBUTOR_RE.fullmatch(object_file) else None
             if not object_file.lower().endswith(".obj"):
                 object_file = None
             symbols.append(MapSymbol(
@@ -114,6 +120,7 @@ def parse_msvc_map_symbols(map_path: str) -> list[MapSymbol]:
                 is_function=bool(rest) and rest[0] == "f",
                 object_file=object_file,
                 visibility=visibility,
+                dll_contributor=dll_contributor,
             ))
 
     symbols.sort(key=lambda entry: (entry.va, entry.symbol))
