@@ -434,9 +434,23 @@ Missing private placements can also be established by an actual, object-qualifie
 COFF relocation graph. Its roots must be complete validated native code, region
 or data contracts with unique same-owner external definitions under `Publics by
 Value`. Only real in-bounds, nonoverlapping i386 DIR32/REL32 records are followed,
-using their exact native symbol indices and addends. Every traversed private code
-label, function, region or data definition needs its own complete strict native
-contract. Derived addresses stay tentative until all source windows in the
+using their exact native symbol indices and addends. Every traversed private
+source needs a complete strict native function, code-label, region or data
+contract. A strong native local LABEL (storage 6, type 0, no auxiliary records)
+may also identify an edge target strictly inside one uniquely owned, completely
+validated code window. Its exact name and native symbol index must identify one
+raw record, and any configured binding must be address-only at the owner's
+original address plus the native offset. The point must be an instruction start
+in the complete original, native-relocated and actual linked code windows;
+ordinary excluded alignment/table suffixes and explicit region inline vectors
+cannot supply code points. Decoding requires the optional Capstone dependency.
+Contained points add no source nodes, roots, MAP providers, data rows, function
+counts or extent claims. Their owner's entire window still participates in the
+proof, and their actual addresses come only from the anchored relocation path.
+An optional same-owner qualified MAP row constrains a used point's value and
+non-function role; contradictory or ambiguous rows reject that proof. Foreign
+or unqualified same-name MAP rows supply no local point identity.
+Derived addresses stay tentative until all source windows in the
 anchored component replay exactly from the COFF bytes with every relocation
 resolved. Known PUBLIC MAP targets are fixed terminals; their values cannot be
 replaced by an inferred address. Conflicting roots or paths, incomplete contracts,

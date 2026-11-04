@@ -13,7 +13,10 @@ from binary_comp.analyzers.coff_report import (
     object_path, region_contracts, validate_native_role,
 )
 from binary_comp.analyzers.exe import linked_map_identity
-from binary_comp.core.coff import COFF, code_window, compare_code_region, compare_function, is_function_type
+from binary_comp.core.coff import (
+    COFF, CodeRegions, code_window, compare_code_region, compare_function, is_function_type,
+)
+from binary_comp.core.disasm import disassemble_raw
 from binary_comp.source.functions import object_member_name
 
 
@@ -125,6 +128,7 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
     """
     owner = module["name"] + ".obj"
     nodes, by_symbol, failures = {}, {}, {}
+    code_payloads, region_entries = {}, {}
     absolute_definitions = absolute_definitions or {}
 
     def add(node):
@@ -157,7 +161,7 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
         try:
             native = coff.named[name]
             validate_native_role(coff, name, kind)
-            exact, _, _, fixups = compare_function(
+            exact, relocated, original, fixups = compare_function(
                 coff, entry, version, bindings, reference,
                 common_definitions=providers, code_regions=regions)
             if not exact:
@@ -167,6 +171,7 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                                  reference, common_definitions=providers, code_regions=regions)
             add(_Node(name, kind, address, native["section"], native["value"],
                       window["data"], window["relocations"], fixups, symbols={name: 0}))
+            code_payloads[name] = original, relocated
         except (KeyError, ValueError) as error:
             failures[name] = str(error)
 
@@ -175,7 +180,7 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
             continue
         name = entry["symbol"]
         try:
-            exact, _, _, fixups = compare_code_region(
+            exact, relocated, original, fixups = compare_code_region(
                 coff, entry, version, bindings, reference,
                 common_definitions=providers, code_regions=regions)
             if not exact:
@@ -184,6 +189,8 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
             add(_Node(name, "region", int(entry[version]["va"], 16), native["section"],
                       0, section["data"], section["relocations"], fixups,
                       symbols={record["symbol"]: record["offset"] for record in entry["entries"]}))
+            code_payloads[name] = original, relocated
+            region_entries[name] = entry
         except (KeyError, ValueError) as error:
             for record in entry["entries"]:
                 failures[record["symbol"]] = str(error)
@@ -224,6 +231,66 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
         elif coff.named.get(native["name"]) is not native:
             raise ValueError(f"Relocation does not name its actual native definition: {native['name']}")
         return native
+
+    # Contained labels are exact relocation targets only. They never enter
+    # by_symbol or node.symbols, which remain declared owner/root identities.
+    points, point_starts = {}, {}
+
+    def private_owner(index, native):
+        name = native["name"]
+        if name in by_symbol:
+            return *by_symbol[name], False
+        if index not in points:
+            if (native["storage"] != 6 or native["type"] != 0 or native["aux_count"]
+                    or sum(record["name"] == name for record in coff.symbols.values()) != 1):
+                raise ValueError(f"Contained point needs one exact strong native LABEL record: {name}")
+            owners = [node for node in nodes.values() if node.kind != "data"
+                      and node.section == native["section"]
+                      and node.start < native["value"] < node.start + len(node.raw)]
+            if len(owners) != 1:
+                raise ValueError(f"Contained point needs one complete validated code owner: {name}")
+            child = owners[0]
+            if any(other is not child and other.section == child.section
+                   and other.start < child.start + len(child.raw)
+                   and child.start < other.start + len(other.raw) for other in nodes.values()):
+                raise ValueError(f"Contained point owner overlaps another native contract: {name}")
+            points[index] = child, native["value"] - child.start
+        return *points[index], True
+
+    def instruction_starts(node, original, relocated):
+        entry = region_entries.get(node.name)
+        if entry is not None and "inline_vectors" in entry:
+            context = regions or CodeRegions(coff, [entry], version, bindings, reference,
+                                             common_definitions=providers)
+            decoded, _ = context.decode_vectors(node.name, original, relocated)
+            return [{instruction.address - node.original for instruction in instructions}
+                    for instructions in decoded.values()]
+        starts = []
+        for payload in (original, relocated):
+            instructions = disassemble_raw(payload, node.original)
+            cursor, boundaries = node.original, set()
+            for instruction in instructions:
+                if instruction.address != cursor or instruction.size <= 0:
+                    raise ValueError("Contained-point instruction coverage is not contiguous")
+                boundaries.add(cursor - node.original)
+                cursor += instruction.size
+            if cursor != node.original + len(node.raw):
+                raise ValueError("Contained-point decoding did not cover the complete code window")
+            starts.append(boundaries)
+        return starts
+
+    def validate_point(native, child, delta, address):
+        name = native["name"]
+        binding = bindings.get(name)
+        if binding is not None and (set(binding) != {"va"}
+                                    or int(binding["va"], 16) != child.original + delta):
+            raise ValueError(f"Contained point binding differs from its native owner offset: {name}")
+        if child.name not in point_starts:
+            point_starts[child.name] = instruction_starts(child, *code_payloads[child.name])
+        actual = source_bytes(child, address)
+        starts = point_starts[child.name] + instruction_starts(child, actual, actual)
+        if any(delta not in boundaries for boundaries in starts):
+            raise ValueError(f"Contained point is not a complete native and actual instruction boundary: {name}")
 
     def source_bytes(node, address):
         if not 0 <= address < address + len(node.raw) <= 0x100000000:
@@ -301,9 +368,12 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                 if (native["storage"] == 2 and mapped is not None
                         and mapped.visibility == "public"):
                     continue
-                if native["section"] == 0 or name not in by_symbol:
+                if native["section"] == 0:
                     continue
-                child, delta = by_symbol[name]
+                try:
+                    child, delta, _ = private_owner(index, native)
+                except ValueError:
+                    continue
                 if child.section == native["section"] and child.start + delta == native["value"]:
                     private.add(child.name)
                     pending.append(child)
@@ -387,15 +457,18 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                     if target is None:
                         if native["section"] == 0:
                             raise ValueError(f"External target needs a unique actual PUBLIC MAP identity: {name}")
-                        if name not in by_symbol:
+                        try:
+                            child, delta, point = private_owner(index, native)
+                        except ValueError as error:
                             reason = failures.get(name, "No complete validated native contract")
-                            raise ValueError(f"Cannot traverse private target {name}: {reason}")
-                        child, delta = by_symbol[name]
+                            raise ValueError(f"Cannot traverse private target {name}: {reason}; {error}") from error
                         if (child.section != native["section"]
                                 or child.start + delta != native["value"]):
                             raise ValueError(f"Private target differs from its exact native contract: {name}")
                         target = inferred
                         base = target - delta
+                        if point:
+                            validate_point(native, child, delta, base)
                         previous = closure.addresses.get(child.name)
                         if previous is not None and previous != base:
                             raise ValueError(f"Conflicting actual private paths: {name}")
@@ -404,14 +477,14 @@ def resolve_private_placements(coff, module, version, bindings, reference, rebui
                         pending.append(child)
                         closure.provenance.append(
                             f"{owner}:{node.name}+{offset:#x} {'REL32' if kind == 20 else 'DIR32'} "
-                            f"index={index} addend={addend:#x} -> private {name} "
+                            f"index={index} addend={addend:#x} -> private {'contained point ' if point else ''}{name} "
                             f"at {target:#010x}; complete {child.kind} owner {child.name}")
                     value = target + addend - (source + offset + 4 if kind == 20 else 0)
                     struct.pack_into("<I", replay, offset, value & 0xFFFFFFFF)
                 if bytes(replay) != actual:
                     raise ValueError(f"Complete actual source replay differs: {node.name}")
             validate_windows(closure.addresses)
-        except (KeyError, ValueError) as error:
+        except (KeyError, ValueError, RuntimeError) as error:
             closure.error = str(error)
         return closure
 
