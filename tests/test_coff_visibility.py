@@ -9,7 +9,7 @@ import pytest
 from binary_comp.cli import main
 from binary_comp.core.coff import COFF
 from binary_comp.core.coff_extension import compare_coff_extension
-from binary_comp.core.coff_visibility import globalize_coff_functions
+from binary_comp.core.coff_visibility import globalize_coff_data, globalize_coff_functions
 from test_coff_contract import coff_bytes
 from test_coff_extension import section_aux
 
@@ -186,3 +186,157 @@ def test_cli_validation_failure_leaves_existing_output_unchanged(tmp_path, capsy
     assert main(["coff-globalize", str(source), str(output), "--function", "missing"]) == 1
     assert "error" in json.loads(capsys.readouterr().out)
     assert output.read_bytes() == b"existing output"
+
+
+DATA_NAMES = ["_slot_zero", "_slot_inner"]
+
+
+def data_fixture():
+    sections, symbols = fixture()
+    symbols.extend([
+        {"name": DATA_NAMES[0], "storage": 3, "section": 3},
+        {"name": DATA_NAMES[1], "storage": 3, "section": 3, "value": 2},
+    ])
+    # An existing code relocation refers to the interior static data symbol.
+    sections[0]["relocations"] = [(0, 12, 20)]
+    return sections, symbols
+
+
+def test_static_data_visibility_changes_only_the_named_storage_bytes():
+    source = pack(data_fixture())
+    original_symbols = deepcopy(source.symbols)
+    output, witness = globalize_coff_data(source, reversed(DATA_NAMES))
+    result = COFF.from_bytes(output)
+    assert witness["operation"] == "coff-data-visibility"
+    assert witness["input_sha256"] == hashlib.sha256(source.data).hexdigest()
+    assert witness["output_sha256"] == hashlib.sha256(output).hexdigest()
+    assert witness["changed_bytes"] == len(witness["data"]) == 2
+    offsets = {row["storage_offset"] for row in witness["data"]}
+    assert {i for i, (old, new) in enumerate(zip(source.data, output)) if old != new} == offsets
+    assert len(source.data) == len(output)
+    assert all(source.data[offset] == 3 and output[offset] == 2 for offset in offsets)
+    assert {row["value"] for row in witness["data"]} == {0, 2}
+    assert all((row["old_storage"], row["new_storage"], row["type"], row["section"]) == (3, 2, 0, 3)
+               for row in witness["data"])
+    assert result.sections == source.sections and result.auxiliary_records == source.auxiliary_records
+    assert result.sections[0]["relocations"] == [(0, 12, 20)]
+    assert source.symbols == original_symbols
+    for row in witness["data"]:
+        assert result.named[row["name"]]["storage"] == 2
+
+
+@pytest.mark.parametrize("change", ["public", "typed", "function", "aux", "common", "weak", "ambiguous", "end"])
+def test_data_visibility_rejects_unsupported_symbol_records(change):
+    parts = data_fixture()
+    symbol = parts[1][-1]
+    if change == "public":
+        symbol["storage"] = 2
+    elif change == "typed":
+        symbol["type"] = 4
+    elif change == "function":
+        symbol["type"] = 0x20
+    elif change == "aux":
+        symbol["aux"] = bytes(18)
+    elif change == "common":
+        symbol.update(storage=2, section=0, value=3)
+    elif change == "weak":
+        symbol.update(storage=105, section=0, value=0, aux=struct.pack("<II10x", 10, 2))
+    elif change == "ambiguous":
+        parts[1].append({"name": DATA_NAMES[1]})
+    else:
+        symbol["value"] = 3
+    with pytest.raises(ValueError):
+        globalize_coff_data(pack(parts), [DATA_NAMES[1]])
+
+
+@pytest.mark.parametrize("change", ["code", "executable", "bss", "comdat", "no_data", "remove", "discardable"])
+def test_data_visibility_requires_file_backed_regular_initialized_storage(change):
+    parts = data_fixture()
+    section = parts[0][2]
+    if change == "code":
+        section["flags"] |= 0x20
+    elif change == "executable":
+        section["flags"] |= 0x20000000
+    elif change == "bss":
+        section.update(flags=0xC0000080, data=b"", size=3)
+    elif change == "comdat":
+        section["flags"] |= 0x1000
+        parts[1][5]["aux"] = section_aux(3, selection=1)
+    elif change == "no_data":
+        section["flags"] &= ~0x40
+    elif change == "remove":
+        section["flags"] |= 0x800
+    else:
+        section["flags"] |= 0x02000000
+    with pytest.raises(ValueError):
+        globalize_coff_data(pack(parts), [DATA_NAMES[1]])
+
+
+def test_data_visibility_validates_selection_and_full_object():
+    for names in ([], [""], ["missing"], [DATA_NAMES[0], DATA_NAMES[0]], DATA_NAMES[0]):
+        with pytest.raises(ValueError):
+            globalize_coff_data(pack(data_fixture()), names)
+    parts = data_fixture()
+    malformed = bytearray(parts[1][0]["aux"])
+    malformed[15] = 1
+    parts[1][0]["aux"] = bytes(malformed)
+    with pytest.raises(ValueError, match="section-definition"):
+        globalize_coff_data(pack(parts), [DATA_NAMES[0]])
+
+
+def test_data_visibility_rejects_symbol_table_alias_of_raw_section():
+    source = pack(data_fixture())
+    index = next(i for i, symbol in source.symbols.items() if symbol["name"] == DATA_NAMES[0])
+    storage = struct.unpack_from("<I", source.data, 8)[0] + index * 18 + 16
+    raw = bytearray(source.data)
+    struct.pack_into("<I", raw, 20 + 20, storage)
+    with pytest.raises(ValueError, match="Symbol table overlaps"):
+        globalize_coff_data(COFF.from_bytes(raw), [DATA_NAMES[0]])
+
+
+def test_data_visibility_cli_writes_witness_and_rejects_mixed_mode(tmp_path, capsys):
+    source, output = tmp_path / "input.obj", tmp_path / "output.obj"
+    original = pack(data_fixture()).data
+    source.write_bytes(original)
+    assert main(["coff-globalize", str(source), str(output), "--data", DATA_NAMES[0],
+                 "--data", DATA_NAMES[1]]) == 0
+    witness = json.loads(capsys.readouterr().out)
+    assert witness["operation"] == "coff-data-visibility" and witness["changed_bytes"] == 2
+    assert source.read_bytes() == original and COFF(output).named[DATA_NAMES[1]]["storage"] == 2
+    with pytest.raises(SystemExit):
+        main(["coff-globalize", str(source), str(output), "--data", DATA_NAMES[0],
+              "--function", FUNCTIONS[0]])
+
+
+@pytest.mark.parametrize("alias", ["same_path", "symlink", "hardlink"])
+def test_data_visibility_cli_rejects_same_file_aliases(tmp_path, capsys, alias):
+    source, output = tmp_path / "input.obj", tmp_path / "alias.obj"
+    original = pack(data_fixture()).data
+    source.write_bytes(original)
+    if alias == "same_path":
+        output = source
+    elif alias == "symlink":
+        output.symlink_to(source)
+    else:
+        output.hardlink_to(source)
+    assert main(["coff-globalize", str(source), str(output), "--data", DATA_NAMES[0]]) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["operation"] == "coff-data-visibility" and "separate files" in result["error"]
+    assert source.read_bytes() == original
+
+
+def test_read_only_initialized_data_is_a_valid_regular_section():
+    parts = data_fixture()
+    parts[0][2]["flags"] = 0x40000040
+    output, witness = globalize_coff_data(pack(parts), [DATA_NAMES[1]])
+    assert witness["data"][0]["value"] == 2
+    assert COFF.from_bytes(output).named[DATA_NAMES[1]]["storage"] == 2
+
+
+def test_data_visibility_cli_invalid_input_preserves_output(tmp_path, capsys):
+    source, output = tmp_path / "input.obj", tmp_path / "output.obj"
+    source.write_bytes(pack(data_fixture()).data)
+    output.write_bytes(b"unchanged")
+    assert main(["coff-globalize", str(source), str(output), "--data", "missing"]) == 1
+    assert json.loads(capsys.readouterr().out)["operation"] == "coff-data-visibility"
+    assert output.read_bytes() == b"unchanged"

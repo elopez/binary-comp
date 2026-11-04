@@ -247,6 +247,15 @@ section, type and value. CLI rejection exits 1, and same-file output aliases are
 rejected. This changes link visibility only; it does not establish source
 recovery, native-PE equality or whole-file equality.
 
+For explicitly named static data, use `coff-globalize input.obj exposed.obj --data _slot_zero`
+(repeat `--data` as needed) or the separate API `globalize_coff_data(coff, names)`.
+Each symbol must be unique, auxiliary-free, storage 3 and type 0, at a byte within a file-backed ordinary initialized data
+section; interior offsets are allowed. Code, executable, BSS and COMDAT
+sections are rejected. Function and data modes cannot be combined in one
+operation. The distinct `coff-data-visibility` witness uses a `data` list with
+the same storage-byte metadata. Callers remain responsible for complete data
+contracts, cross-object name collisions and linked verification.
+
 ## Configuration
 
 The standalone config is target-oriented. A target describes the original PE,

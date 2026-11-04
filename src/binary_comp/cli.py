@@ -1433,26 +1433,31 @@ def run_coff_compare(args) -> int:
 
 
 def add_coff_globalize_parser(subparsers) -> None:
-    parser = subparsers.add_parser("coff-globalize", help="Expose named static COMDAT functions with storage-byte edits only")
+    parser = subparsers.add_parser("coff-globalize", help="Expose named static COFF symbols with storage-byte edits only")
     parser.add_argument("input", help="Input i386 COFF object")
     parser.add_argument("output", help="Separate output i386 COFF object")
-    parser.add_argument("--function", action="append", required=True, metavar="NAME",
-                        help="Static COMDAT function to expose; repeat as needed")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--function", action="append", metavar="NAME",
+                       help="Static COMDAT function to expose; repeat as needed")
+    group.add_argument("--data", action="append", metavar="NAME",
+                       help="Static ordinary initialized data symbol to expose; repeat as needed")
     parser.set_defaults(handler=run_coff_globalize)
 
 
 def run_coff_globalize(args) -> int:
     from binary_comp.core.coff import COFF
-    from binary_comp.core.coff_visibility import globalize_coff_functions
+    from binary_comp.core.coff_visibility import globalize_coff_data, globalize_coff_functions
 
+    operation = "coff-data-visibility" if args.data is not None else "coff-function-visibility"
     try:
         source, destination = Path(args.input), Path(args.output)
         if source.resolve() == destination.resolve() or destination.exists() and source.samefile(destination):
             raise ValueError("Input and output must be separate files")
-        output, witness = globalize_coff_functions(COFF(source), args.function)
+        output, witness = (globalize_coff_data(COFF(source), args.data) if args.data is not None
+                           else globalize_coff_functions(COFF(source), args.function))
         destination.write_bytes(output)
     except (OSError, ValueError) as error:
-        print(json.dumps({"operation": "coff-function-visibility", "error": str(error)}, sort_keys=True))
+        print(json.dumps({"operation": operation, "error": str(error)}, sort_keys=True))
         return 1
     print(json.dumps(witness, sort_keys=True))
     return 0
