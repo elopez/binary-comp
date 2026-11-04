@@ -300,3 +300,18 @@ def test_failed_roots_sharing_a_contained_owner_are_atomic(points, reverse):
         row = rows(points)[name]
         assert row.rebuilt_address is None
         assert "conflicts with MAP target" in row.detail
+
+
+def test_partial_fragment_never_grants_contained_point_graph_trust(points):
+    module = points["module"]
+    owner = next(entry for entry in module["functions"] if entry["symbol"] == "handler")
+    module["functions"].remove(owner)
+    original = owner["retail"]
+    module["code_fragments"] = [{"symbol": owner["symbol"], "label": "partial handler",
+                                 "retail": {"va": original["va"], "owner_va": original["va"],
+                                            "object_offset": 0, "size": original["size"]}}]
+    save_project(points)
+    result = rows(points)
+    assert result["info"].rebuilt_address is None
+    assert result["unwind"].rebuilt_address is None
+    assert result["_public"].rebuilt_address is not None

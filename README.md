@@ -532,11 +532,33 @@ REL32 fixups separately. Any code, extent, data or decode failure produces a
 nonzero exit status. Mnemonic similarity remains diagnostic, and the existing
 PE relocation-normalized `report --bytes` mode is unchanged.
 
-Every code entry requires its complete original extent. Compiler EH entries
+Functions, labels and regions each require their complete original extent. Compiler EH entries
 belong in a separate `code_labels` list with the same shape. Complete data
 definitions use `data_size` or `data_hex`; defined data referenced by code must
 have one of these complete bindings. Unknown targets, unsupported relocations,
-weak-fallback cycles, partial definitions and unexpected non-NOP tails fail.
+weak-fallback cycles, partial data definitions and unexpected non-NOP tails fail.
+
+A separate `code_fragments` list declares fixed partial instruction windows:
+
+```json
+{"label": "initial step", "symbol": "_build", "retail": {
+  "va": "0x10002010", "owner_va": "0x10002000", "object_offset": 16, "size": 32
+}}
+```
+
+`owner_va` independently states the original function start and its external
+identity; `object_offset` is relative to the actual typed COFF function start,
+not the original offset. Both full prefixes through the fragment end must be
+file-backed executable instruction streams with boundaries at the fragment
+start and end. Capstone is required. Only relocations wholly inside the fixed
+window are applied with the ordinary strict binding and data checks; all bytes
+participate in raw and relocation-corrected comparisons. Windows may not overlap
+other fragments or complete code/data owners. Inline data and region ownership
+are not supported. Reports put partial results in `fragments`, separate from
+complete code rows and totals, and filtered `compare` prints a partial review.
+Bytes outside each window remain unverified; no complete function, label,
+region, graph ownership or recovery-byte claim follows. The complete-function
+score mode rejects fragments.
 
 An emitted data definition can be fully checked without adding original-storage
 coverage by using `data_check_only: true` alongside `va` and exactly one complete
@@ -889,7 +911,7 @@ contribute to the score. Rejected extents use the complete diagnostic code windo
 and a minimum score of one; they can never count as exact.
 
 Scoring requires `--object`, explicit `--no-build`, one target (not `all`), one
-selected module and one native function. `code_labels`, ambiguous selections,
+selected module and one native function. `code_labels`, `code_fragments`, ambiguous selections,
 disassembly exports and `--output` are rejected. Invalid objects, references,
 bindings, relocations or configured data exit with status 2, an error on stderr
 and no score on stdout. The mode does not build, decode instructions, write or

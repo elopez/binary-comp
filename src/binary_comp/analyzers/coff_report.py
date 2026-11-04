@@ -15,7 +15,7 @@ import re
 
 from binary_comp.config import ConfigError, load_json, load_project_target
 from binary_comp.core.coff import (COFF, CodeRegions, BodyExtentError, apply_fixups, code_window, compare_code_region,
-                                   compare_function, data_check_only_size, executable_data_definitions, executable_data_size,
+                                   compare_function, compare_code_fragment, data_check_only_size, executable_data_definitions, executable_data_size,
                                    inline_table_alignment, inline_vector_records, is_function_type, section_layout_definitions, section_layout_only, section_layout_size,
                                    validate_common_definitions,
                                    validate_data_binding)
@@ -23,7 +23,7 @@ from binary_comp.core.pe import FileBackedPEImage
 
 PE = FileBackedPEImage
 CODE_ROLES = (("functions", "function"), ("code_labels", "label"), ("code_regions", "region"))
-CODE_KEYS = tuple(key for key, _ in CODE_ROLES)
+CODE_KEYS = tuple(key for key, _ in CODE_ROLES) + ("code_fragments",)
 
 
 def region_contracts(module):
@@ -189,6 +189,20 @@ def _code_bindings(bindings, entries, version):
     return result
 
 
+def fragment_bindings(bindings, entries, version):
+    """Register independent owner identities; never bind to the partial start."""
+    result = dict(bindings)
+    for entry in entries:
+        if version not in entry:
+            continue
+        name, address = entry["symbol"], entry[version]["owner_va"]
+        previous = result.get(name)
+        if previous is not None and int(previous["va"], 16) != int(address, 16):
+            raise ConfigError(f"Conflicting code fragment owner address for {name}")
+        result[name] = {**(previous or {}), "va": address}
+    return result
+
+
 def load_selection(config_path, target_name, module_names=None, function_name=None):
     """Load explicit modules and arbitrary target names without source parsing."""
     config_path = Path(config_path).resolve()
@@ -230,7 +244,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
     for module in modules:
         if not isinstance(module, dict):
             raise ConfigError("COFF modules must be objects")
-        if {"_code_region_dependencies", "_ordinary_code_owners"} & module.keys():
+        if {"_code_region_dependencies", "_ordinary_code_owners", "_code_fragment_dependencies", "_fragment_validation_modules"} & module.keys():
             raise ConfigError("COFF module uses reserved selection metadata")
         name = _component(module.get("name"), "COFF module name")
         if name in seen:
@@ -263,6 +277,8 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                     raise ConfigError("anchor_offset is only supported for code_regions")
                 if key != "code_regions" and "inline_vectors" in entry:
                     raise ConfigError("inline_vectors is only supported for code_regions")
+                if key == "code_fragments" and ({"entries", "inline_vectors", "anchor_offset"} & entry.keys()):
+                    raise ConfigError("Code fragments do not own inline data or regions")
                 for target_name in targets:
                     if target_name not in entry:
                         continue
@@ -271,6 +287,12 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                             or binding["size"] <= 0 or not isinstance(binding.get("va"), str)):
                         raise ConfigError(f"Invalid complete COFF extent for {entry['label']}")
                     int(binding["va"], 16)
+                    if key == "code_fragments":
+                        if (not isinstance(binding.get("owner_va"), str)
+                                or type(binding.get("object_offset")) is not int
+                                or binding["object_offset"] < 0):
+                            raise ConfigError("Invalid code fragment owner or offset")
+                        int(binding["owner_va"], 16)
                     if key == "code_regions" and anchor_offset >= binding["size"]:
                         raise ConfigError("Code region anchor_offset outside complete extent")
         bindings = module.get("bindings", {})
@@ -295,14 +317,17 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
                     data_check_only_size(symbol, binding)
                 except ValueError as error:
                     raise ConfigError(str(error)) from error
-            _code_bindings(bindings.get(target_name, {}),
-                           ordinary_entries(module), target_name)
+            fragment_bindings(_code_bindings(bindings.get(target_name, {}),
+                           ordinary_entries(module), target_name), module.get("code_fragments", []), target_name)
+    fragment_validation_modules = modules if any(module.get("code_fragments") for module in modules) else None
+    if fragment_validation_modules is not None:
+        validate_counted_code(modules, list(targets))
     if module_names:
         if set(module_names) - seen:
             raise ConfigError("Unknown COFF module: " + ", ".join(sorted(set(module_names) - seen)))
         modules = [m for m in modules if m["name"] in module_names]
     if function_name is not None:
-        if any(module.get("code_regions") for module in modules):
+        if any(module.get("code_regions") or module.get("code_fragments") for module in modules):
             validate_counted_code(modules, list(targets))
         selected = []
         for module in modules:
@@ -315,6 +340,7 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
             narrowed = dict(module)
             narrowed["_code_region_dependencies"] = region_contracts(module)
             narrowed["_ordinary_code_owners"] = ordinary_entries(module)
+            narrowed["_code_fragment_dependencies"] = module.get("code_fragments", [])
             # All function addresses remain available to code and data fixups.
             narrowed["bindings"] = {
                 name: _code_bindings(module.get("bindings", {}).get(name, {}),
@@ -326,6 +352,8 @@ def load_selection(config_path, target_name, module_names=None, function_name=No
         modules = selected
         if not modules:
             raise ConfigError(f"COFF function not found: {function_name}")
+    if fragment_validation_modules is not None:
+        modules = [{**module, "_fragment_validation_modules": fragment_validation_modules} for module in modules]
     return modules, targets, paths[0] if len(paths) == 1 else paths
 
 
@@ -334,7 +362,7 @@ def _invalidate_report_outputs(output):
     for filename in ("report.json", "report.txt"):
         (output / filename).unlink(missing_ok=True)
     for path in output.glob("*/*/*.txt"):
-        if re.fullmatch(r"[0-9a-f]{8}-(function|label|region)\.txt", path.name):
+        if re.fullmatch(r"[0-9a-f]{8}-(function|label|region|fragment)\.txt", path.name):
             path.unlink(missing_ok=True)
 
 
@@ -364,7 +392,7 @@ def run_config(config_path, target_name, output, *, module_names=None,
                       manifest_path=manifest, source_root=source_root)
     if show_reviews:
         result = json.loads((output / "report.json").read_text())
-        for row in result["code"]:
+        for row in result["code"] + result.get("fragments", []):
             if "review" in row:
                 print((output / row["review"]).read_text())
     return int(bool(failures))
@@ -510,7 +538,8 @@ def score_config(config_path, target_name, function_name, object_path, *, module
     module = modules[0]
     functions = [f for f in module.get("functions", []) if target_name in f]
     labels = [f for f in module.get("code_labels", []) if target_name in f]
-    if len(functions) != 1 or labels or any(target_name in r for r in module.get("code_regions", [])):
+    if (len(functions) != 1 or labels or any(target_name in r for key in
+            ("code_regions", "code_fragments", "_code_fragment_dependencies") for r in module.get(key, []))):
         raise ConfigError("COFF scoring requires exactly one native function")
     validate_counted_code(modules, [target_name])
     reference, _ = load_reference(targets[target_name], target_name)
@@ -548,7 +577,7 @@ def validate_counted_code(modules, versions):
     """Disjoint original owners across code roles, including region dependencies."""
     for version in versions:
         symbols = set()
-        windows, regions, data, dependencies = [], [], [], []
+        windows, regions, data, dependencies, fragments = [], [], [], [], []
         for module in modules:
             selected = ordinary_entries(module)
             for entry in ordinary_owners(module):
@@ -575,6 +604,18 @@ def validate_counted_code(modules, versions):
                 windows.append(window)
                 if entry in region_contracts(module):
                     regions.append(window)
+            for entry in module.get("code_fragments", []) + [
+                    f for f in module.get("_code_fragment_dependencies", [])
+                    if f not in module.get("code_fragments", [])]:
+                if version not in entry:
+                    continue
+                target = entry[version]
+                start, owner, size, offset = (int(target["va"], 16), int(target["owner_va"], 16),
+                                              target["size"], target["object_offset"])
+                if (type(size) is not int or size <= 0 or type(offset) is not int or offset < 0
+                        or not 0 <= owner <= start < start + size <= 0x100000000):
+                    raise ValueError("Invalid code fragment range")
+                fragments.append((start, start + size, module["name"], entry["symbol"]))
             for name, binding in module.get("bindings", {}).get(version, {}).items():
                 if "data_hex" in binding or "data_size" in binding:
                     size = (len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding
@@ -590,6 +631,10 @@ def validate_counted_code(modules, versions):
             if left[1] > right[0]:
                 raise ValueError(f"Overlapping original COFF code windows for {version}: "
                                  f"{left[2]}:{left[3]} and {right[2]}:{right[3]}")
+        for index, fragment in enumerate(fragments):
+            for other in windows + dependencies + data + fragments[index + 1:]:
+                if fragment[0] < other[1] and other[0] < fragment[1]:
+                    raise ValueError("Code fragment overlaps configured code or data")
         for region in regions:
             for definition in data:
                 if region[0] < definition[1] and definition[0] < region[1]:
@@ -619,7 +664,8 @@ def validate_section_layout_owners(records, version, reference):
                 raise ValueError("Duplicate native section layout contribution ownership")
             physical.add(identity)
             layouts.append((start, start + size, module["name"], members))
-        for entry in ordinary_owners(module) + region_contracts(module):
+        for entry in ordinary_owners(module) + region_contracts(module) + module.get("code_fragments", []) + [
+                f for f in module.get("_code_fragment_dependencies", []) if f not in module.get("code_fragments", [])]:
             if version in entry:
                 target = entry[version]
                 start = int(target["va"], 16)
@@ -642,13 +688,66 @@ def validate_section_layout_owners(records, version, reference):
                 raise ValueError("Overlapping complete section layouts")
 
 
+def validate_fragment_ownership(records, version):
+    """Reject overlapping native partial and complete code windows, including aliases."""
+    if not any(module.get("code_fragments") or module.get("_code_fragment_dependencies")
+               for module, _, _ in records):
+        return
+    fragments, complete = [], []
+    for module, coff, path in records:
+        identity = Path(path).resolve()
+        for entry in ordinary_owners(module) + region_contracts(module):
+            if version not in entry:
+                continue
+            if entry in region_contracts(module):
+                section = coff.code_region(entry["symbol"], entry["entries"],
+                                           anchor_offset=entry.get("anchor_offset", 0))
+                owner, start, end = section, 0, len(section["data"])
+            else:
+                symbol, native = coff.definition(entry["symbol"])
+                section = coff.function(entry["symbol"])
+                if is_function_type(symbol["type"]):
+                    owner, start, end = coff.function_owner(section)
+                else:
+                    owner, start = native, symbol["value"]
+                    end = start + len(section["data"])
+            index = next(i for i, native in enumerate(coff.sections) if native is owner)
+            complete.append((identity, index, start, end))
+        for name, binding in module.get("bindings", {}).get(version, {}).items():
+            if "data_hex" not in binding and "data_size" not in binding:
+                continue
+            try:
+                symbol, section = coff.definition(name)
+            except (KeyError, ValueError):
+                continue
+            index = next(i for i, native in enumerate(coff.sections) if native is section)
+            size = len(bytes.fromhex(binding["data_hex"])) if "data_hex" in binding else binding["data_size"]
+            complete.append((identity, index, symbol["value"], symbol["value"] + size))
+        selected = module.get("code_fragments", [])
+        for entry in selected + [f for f in module.get("_code_fragment_dependencies", []) if f not in selected]:
+            if version not in entry:
+                continue
+            section = coff.function(entry["symbol"])
+            owner, start, end = coff.function_owner(section)
+            offset, size = entry[version]["object_offset"], entry[version]["size"]
+            if offset + size > end - start:
+                raise ValueError("Code fragment outside native function window")
+            index = next(i for i, native in enumerate(coff.sections) if native is owner)
+            fragments.append((identity, index, start + offset, start + offset + size))
+    for index, fragment in enumerate(fragments):
+        for other in complete + fragments[index + 1:]:
+            if (fragment[:2] == other[:2] and fragment[2] < other[3]
+                    and other[2] < fragment[3]):
+                raise ValueError("Code fragment overlaps native complete or partial code")
+
+
 def validate_native_role(coff, symbol, kind):
     """Use native symbol records, never disassembly, to classify counted code."""
     try:
         definition, _ = coff.definition(symbol)
     except KeyError as error:
         raise ValueError(f"Counted COFF symbol is not defined: {symbol}") from error
-    if kind == "function":
+    if kind in ("function", "fragment"):
         if not is_function_type(definition["type"]):
             raise ValueError(f"Counted COFF function needs native function type: {symbol}")
     elif kind == "label":
@@ -681,7 +780,7 @@ def register_external_bindings(seen, coff, bindings, version, owner):
 
 
 def report(modules, targets, versions, output, *, manifest_path=None, source_root=None):
-    rows, data_rows, data_checks = [], [], []
+    rows, fragment_rows, data_rows, data_checks = [], [], [], []
     output = Path(output)
     object_hashes = {}
     provider_hashes = {}
@@ -699,16 +798,43 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
         reference_hashes[version] = actual_hash
         prepared = []
         for module in modules:
-            entries = [(kind, f) for key, kind in CODE_ROLES
+            entries = [(kind, f) for key, kind in CODE_ROLES + (("code_fragments", "fragment"),)
                        for f in module.get(key, []) if version in f]
             if (not entries and not module.get("bindings", {}).get(version)
                     and not _common_definition_records(module).get(version)):
                 continue
             coff = load_object(module, target_config)
             common_definitions, hashes = load_common_definitions(module, target_config, version)
-            bindings = _code_bindings(module.get("bindings", {}).get(version, {}),
-                                      ordinary_entries(module), version)
+            bindings = fragment_bindings(
+                _code_bindings(module.get("bindings", {}).get(version, {}), ordinary_entries(module), version),
+                module.get("code_fragments", []) + [f for f in module.get("_code_fragment_dependencies", [])
+                                                     if f not in module.get("code_fragments", [])], version)
             prepared.append((module, entries, coff, common_definitions, hashes, bindings))
+        validation_modules = next((module["_fragment_validation_modules"] for module in modules
+                                   if "_fragment_validation_modules" in module), None)
+        if validation_modules is not None:
+            validation_records = [(module, load_object(module, target_config),
+                                   object_path(target_config, module["name"] + ".obj"))
+                                  for module in validation_modules
+                                  if (any(version in entry for key in CODE_KEYS for entry in module.get(key, []))
+                                      or module.get("bindings", {}).get(version)
+                                      or _common_definition_records(module).get(version))]
+            validate_fragment_ownership(validation_records, version)
+            if any("section_layout" in binding for module, _, _ in validation_records
+                   for binding in module.get("bindings", {}).get(version, {}).values()):
+                layout_records = []
+                for module, coff, path in validation_records:
+                    bindings = fragment_bindings(_code_bindings(
+                        module.get("bindings", {}).get(version, {}), ordinary_entries(module), version),
+                        module.get("code_fragments", []), version)
+                    providers, _ = load_common_definitions(module, target_config, version)
+                    layout_records.append((module, coff, bindings, providers, path))
+                validate_section_layout_owners(layout_records, version, reference)
+        elif any(module.get("code_fragments") or module.get("_code_fragment_dependencies")
+                 for module, _, _, _, _, _ in prepared):
+            validate_fragment_ownership([
+                (module, coff, object_path(target_config, module["name"] + ".obj"))
+                for module, _, coff, _, _, _ in prepared], version)
         validate_section_layout_owners([
             (module, coff, bindings, providers,
              object_path(target_config, module["name"] + ".obj")
@@ -740,12 +866,20 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 row = {"version": version, "module": module["name"], "kind": kind,
                        "label": function["label"], "symbol": function["symbol"],
                        "original_va": target["va"], "body_size": target["size"]}
+                if kind == "fragment":
+                    row.update(owner_va=target["owner_va"], object_offset=target["object_offset"],
+                               partial=True)
                 relative = Path(version) / module["name"] / f"{int(target['va'], 16):08x}-{kind}.txt"
                 destination = output / relative
                 destination.unlink(missing_ok=True)
                 section = None
                 try:
-                    if kind == "region":
+                    if kind == "fragment":
+                        _, rebuilt, original, fixups, raw = compare_code_fragment(
+                            coff, function, version, bindings, reference,
+                            common_definitions=common_definitions, code_regions=code_regions)
+                        window = {"data": raw, "excluded_nop_padding": 0}
+                    elif kind == "region":
                         section = coff.code_region(function["symbol"], function["entries"],
                                                    anchor_offset=function.get("anchor_offset", 0))
                         _, rebuilt, original, fixups = compare_code_region(
@@ -775,6 +909,8 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                         metrics, review = compare_windows(function["label"], int(target["va"], 16),
                                                           original, window["data"], rebuilt)
                     destination.parent.mkdir(parents=True, exist_ok=True)
+                    if kind == "fragment":
+                        review = ("Partial instruction fragment only; bytes outside this window are unverified.\n\n" + review)
                     destination.write_text(review)
                     row.update(metrics, checked_fixups=fixups,
                                excluded_nop_padding=window["excluded_nop_padding"],
@@ -796,7 +932,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                             row.update(metrics, review=str(relative))
                         except (ValueError, KeyError) as diagnostic_exc:
                             row["diagnostic_error"] = str(diagnostic_exc)
-                rows.append(row)
+                (fragment_rows if kind == "fragment" else rows).append(row)
             for name, binding in bindings.items():
                 if "data_hex" not in binding and "data_size" not in binding:
                     continue
@@ -818,12 +954,12 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                 except (ValueError, KeyError) as exc:
                     row.update(exact=False, error=str(exc))
                 (data_checks if data_check_only_size(name, binding) is not None else data_rows).append(row)
-    if not rows and not data_rows and not data_checks:
+    if not rows and not fragment_rows and not data_rows and not data_checks:
         raise ValueError("No configured code or data selected")
     result = {
         "schema": 1,
         "tool": {"name": "binary-comp", "capstone": metadata.version("capstone")},
-        "scope": "Configured complete COFF functions, compiler labels and separately counted complete code regions",
+        "scope": "Configured complete COFF code owners and separately reported partial instruction fragments",
         "semantics": {
             "raw_bytes": "All original bytes vs COFF body before fixups; no masks",
             "relocated_bytes": "All original bytes vs body after explicit checked COFF fixups; no masks",
@@ -831,6 +967,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "mnemonic_similarity": "binary-comp normalized linear mnemonic Levenshtein score; ignores all operands",
             "data": "Complete configured COFF definitions, including native inline tables and sectionless COMMON contributions with logical zeros or explicitly selected strong providers, with explicit fixups; COMMON checks one object's request, not final linker allocation; excluded from code metrics",
             "external_bindings": "Native storage-2 external address bindings agree by name within each selected target across selected modules and explicit COMMON providers; excludes static/local, weak, absolute and debug records; no claim about unselected objects or whole-link resolution",
+            "fragments": "Fixed partial instruction windows only; all bytes outside the windows and complete owner recovery are unverified; excluded from complete code totals",
             "regions": "Complete multi-entry contributions including padding; entries are metadata, not independent function counts",
             "whole_executable_equality": "Not tested: no rebuilt linked executable exists",
         },
@@ -841,7 +978,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "objects_sha256": object_hashes,
             "provider_objects_sha256": provider_hashes,
         },
-        "code": rows, "data": data_rows,
+        "code": rows, "fragments": fragment_rows, "data": data_rows,
     }
     if data_checks:
         result["data_checks"] = data_checks
@@ -851,7 +988,7 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
             "no canonical storage or alias relationship is established")
     (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     lines = ["binary-comp COFF-stage report; mnemonic similarity is not byte equality."]
-    for row in rows:
+    for row in rows + fragment_rows:
         details = ["ERROR " + row["error"]] if "error" in row else []
         if "relocated_bytes" in row:
             similarity = row["mnemonic_similarity"]
@@ -886,6 +1023,13 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
                     and r.get("relocated_bytes", {}).get("exact", False)]
         lines.append(f"  {sum(r['body_size'] for r in accepted)} exact bytes; "
                      f"{sum(r['checked_fixups'] for r in accepted)} checked code fixups.")
+    accepted_fragments = [r for r in fragment_rows if "error" not in r
+                          and r.get("relocated_bytes", {}).get("exact", False)]
+    raw_fragments = sum("error" not in r and r.get("raw_bytes", {}).get("exact", False)
+                        for r in fragment_rows)
+    lines.append(f"Partial fragments: {raw_fragments}/{len(fragment_rows)} raw-byte equal; "
+                 f"{len(accepted_fragments)}/{len(fragment_rows)} relocated-byte equal; "
+                 "excluded from complete code totals; bytes outside each fragment are unverified.")
     for row in data_rows:
         if not row["exact"]:
             lines.append(f"FAIL DATA {row['version']} {row['symbol']}: {row['error']}")
@@ -904,4 +1048,4 @@ def report(modules, targets, versions, output, *, manifest_path=None, source_roo
     print("\n".join(lines))
     print(f"JSON and per-body binary-comp reviews: {output}")
     return sum("error" in r or "metric_error" in r or not r.get("relocated_bytes", {}).get("exact", False)
-               for r in rows) + sum(not r["exact"] for r in data_rows + data_checks)
+               for r in rows + fragment_rows) + sum(not r["exact"] for r in data_rows + data_checks)

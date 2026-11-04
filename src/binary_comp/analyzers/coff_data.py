@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from binary_comp.analyzers.coff_report import (
-    _code_bindings, load_common_definitions, load_object, load_reference,
+    _code_bindings, fragment_bindings, load_common_definitions, load_object, load_reference,
     ordinary_entries, region_context, register_external_bindings, validate_counted_code,
 )
 from binary_comp.analyzers.exe import linked_map_identity
@@ -94,8 +94,12 @@ def compare_linked_data(target, modules, *, allow_empty=False):
     absolutes = load_absolute_definitions(target)
     rows, externals = [], {}
     for module in modules:
-        bindings = _code_bindings(module.get("bindings", {}).get(target.name, {}),
-                                  ordinary_entries(module), target.name)
+        selected_fragments = module.get("code_fragments", [])
+        fragments = selected_fragments + [f for f in module.get("_code_fragment_dependencies", [])
+                                          if f not in selected_fragments]
+        bindings = fragment_bindings(_code_bindings(module.get("bindings", {}).get(target.name, {}),
+                                                   ordinary_entries(module), target.name),
+                                     fragments, target.name)
         selected = [(name, binding) for name, binding in bindings.items()
                     if ("data_hex" in binding or "data_size" in binding)
                     and data_check_only_size(name, binding) is None]

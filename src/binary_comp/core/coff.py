@@ -1262,6 +1262,101 @@ def _compare_function(coff, function, version, bindings, reference, *, common_de
     return compare_binary(expected, actual).exact, actual, expected, relocations
 
 
+
+def compare_code_fragment(coff, fragment, version, bindings, reference, *,
+                          common_definitions=None, code_regions=None):
+    """Compare a fixed partial instruction window without claiming its owner."""
+    from binary_comp.core.disasm import disassemble_raw
+    from binary_comp.core.pe import EXECUTABLE_FLAG
+
+    target = fragment[version]
+    if not isinstance(target.get("va"), str) or not isinstance(target.get("owner_va"), str):
+        raise ValueError("Invalid code fragment address")
+    address = _binding_address(target["va"], fragment["symbol"])
+    owner_address = _binding_address(target["owner_va"], fragment["symbol"])
+    offset, size = target["object_offset"], target["size"]
+    if (type(offset) is not int or offset < 0 or type(size) is not int or size <= 0
+            or address < owner_address or address + size > 0x100000000):
+        raise ValueError("Invalid code fragment range")
+    symbol, native = coff.definition(fragment["symbol"])
+    if (not is_function_type(symbol["type"]) or symbol["storage"] not in (2, 3)
+            or not native["flags"] & 0x20 or not native["flags"] & 0x20000000):
+        raise ValueError("Code fragment requires a typed executable function")
+    section = coff.function(fragment["symbol"])
+    owner, start, end = coff.function_owner(section)
+    if offset + size > len(section["data"]):
+        raise ValueError("Code fragment outside native function window")
+    for native_symbol in coff.symbols.values():
+        if (native_symbol["section"] == symbol["section"]
+                and native_symbol["storage"] in (2, 3)
+                and native_symbol["type"] == 0
+                and start <= native_symbol["value"] < end
+                and not _is_section_definition(coff, native_symbol, owner)):
+            raise ValueError("Code fragment function contains native data")
+    # A partial claim cannot own an inline table, vector, or other data. Refuse
+    # configured data in this native function even if outside the chosen slice.
+    for name, binding in bindings.items():
+        if not ({"data_hex", "data_size", "inline_data", "inline_index_for"} & binding.keys()):
+            continue
+        try:
+            data_symbol, data_section = coff.definition(name)
+        except (KeyError, ValueError):
+            continue
+        if data_section is owner and start <= data_symbol["value"] < end:
+            raise ValueError("Code fragment function contains configured data")
+    if code_regions is not None and id(owner) in code_regions.sections:
+        raise ValueError("Code fragment cannot share a complete code region")
+    existing = bindings.get(fragment["symbol"])
+    if existing is not None and _binding_address(existing["va"], fragment["symbol"]) != owner_address:
+        raise ValueError("Code fragment owner binding differs from declared owner_va")
+    bindings = {**bindings, fragment["symbol"]: {**(existing or {}), "va": target["owner_va"]}}
+    _validate_function_alias_bindings(coff, section, owner_address, bindings)
+    _layout_code_window(coff, bindings, reference, address, size, common_definitions)
+    for _, data_section, data_address, data_size in executable_data_definitions(
+            coff, bindings, reference, common_definitions=common_definitions).values():
+        if data_section is owner or (address < data_address + data_size and data_address < address + size):
+            raise ValueError("Code fragment overlaps complete executable data")
+    if code_regions is not None:
+        for region in code_regions.regions.values():
+            target_region = region[code_regions.version]
+            region_start = _binding_address(target_region["va"], region["symbol"])
+            if address < region_start + target_region["size"] and region_start < address + size:
+                raise ValueError("Code fragment overlaps complete code region")
+    original_section = reference.section_for_va(owner_address)
+    if (original_section is None or not original_section.flags & EXECUTABLE_FLAG
+            or address + size > original_section.start + original_section.rawsize):
+        raise ValueError("Code fragment original prefix is not file-backed executable code")
+    prefix_size = address + size - owner_address
+    original_prefix = reference.read(owner_address, prefix_size)
+    if not isinstance(original_prefix, bytes) or len(original_prefix) != prefix_size:
+        raise ValueError("Code fragment original prefix is not completely file-backed")
+    actual_prefix = section["data"][:offset + size]
+
+    def boundaries(data, origin, boundary):
+        instructions = disassemble_raw(data, origin, bits=32)
+        ends = {0}
+        ends.update(i.address + i.size - origin for i in instructions)
+        if len(data) not in ends or boundary not in ends:
+            raise ValueError("Code fragment boundary splits or follows undecodable instructions")
+
+    boundaries(actual_prefix, 0, offset)
+    boundaries(original_prefix, owner_address, address - owner_address)
+    relocations = []
+    occupied = set()
+    for at, index, kind in section["relocations"]:
+        if at < 0 or at + 4 > len(section["data"]) or occupied.intersection(range(at, at + 4)):
+            raise ValueError("Relocation outside function or overlapping relocation")
+        occupied.update(range(at, at + 4))
+        if at < offset + size and at + 4 > offset:
+            if at < offset or at + 4 > offset + size:
+                raise ValueError("Relocation crosses code fragment boundary")
+            relocations.append((at - offset, index, kind))
+    raw = section["data"][offset:offset + size]
+    rebuilt, count = apply_fixups(coff, raw, relocations, address, bindings, reference,
+                                  common_definitions=common_definitions, code_regions=code_regions)
+    original = original_prefix[-size:]
+    return compare_binary(original, rebuilt).exact, rebuilt, original, count, raw
+
 def inline_vector_records(region):
     """Validate region-only native vector declarations, never arbitrary ranges."""
     if "inline_vectors" not in region:
