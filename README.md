@@ -548,9 +548,13 @@ A separate `code_fragments` list declares fixed partial instruction windows:
 
 `owner_va` independently states the original function start and its external
 identity; `object_offset` is relative to the actual typed COFF function start,
-not the original offset. Both full prefixes through the fragment end must be
-file-backed executable instruction streams with boundaries at the fragment
-start and end. Capstone is required. Only relocations wholly inside the fixed
+not the original offset. The original prefix must be file-backed executable
+code; the actual COFF prefix must decode linearly through the fragment end.
+If the original linear boundary proof fails, a bounded walk from `owner_va`
+follows direct branches only, requires complete unique instruction coverage of
+the fragment, and rejects overlapping instructions or branches into their
+interiors. Indirect jump tables are not guessed. Capstone is required. Only
+relocations wholly inside the fixed
 window are applied with the ordinary strict binding and data checks; all bytes
 participate in raw and relocation-corrected comparisons. Windows may not overlap
 other fragments or complete code/data owners. Inline data and region ownership

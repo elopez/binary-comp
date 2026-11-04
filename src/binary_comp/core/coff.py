@@ -1266,7 +1266,8 @@ def _compare_function(coff, function, version, bindings, reference, *, common_de
 def compare_code_fragment(coff, fragment, version, bindings, reference, *,
                           common_definitions=None, code_regions=None):
     """Compare a fixed partial instruction window without claiming its owner."""
-    from binary_comp.core.disasm import disassemble_raw
+    from bisect import bisect_right
+    from binary_comp.core.disasm import disassemble_raw, disassemble_reachable_x86, unsigned32
     from binary_comp.core.pe import EXECUTABLE_FLAG
 
     target = fragment[version]
@@ -1340,7 +1341,50 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
             raise ValueError("Code fragment boundary splits or follows undecodable instructions")
 
     boundaries(actual_prefix, 0, offset)
-    boundaries(original_prefix, owner_address, address - owner_address)
+    try:
+        boundaries(original_prefix, owner_address, address - owner_address)
+    except ValueError:
+        # Decode the already-verified immutable prefix only, with no guessed
+        # indirect edges. The walk is hard-bounded at the fragment end.
+        class PrefixImage:
+            def section_end_for_va(self, va):
+                return owner_address + len(original_prefix) if va == owner_address else None
+
+            def read(self, va, length):
+                start = va - owner_address
+                if not 0 <= start <= start + length <= len(original_prefix):
+                    return None
+                return original_prefix[start:start + length]
+
+        instructions = disassemble_reachable_x86(
+            PrefixImage(), owner_address, (), len(original_prefix), frozenset(),
+            expand_indirect_jump_tables=False)
+        starts = [instruction.address for instruction in instructions]
+        for left, right in zip(instructions, instructions[1:]):
+            if left.address + left.size > right.address:
+                raise ValueError("Reachable code has overlapping instruction intervals")
+        for instruction in instructions:
+            mnemonic = instruction.mnemonic.split()[-1]
+            if not (mnemonic.startswith("j") or mnemonic in {"call", "loop", "loope", "loopne"}):
+                continue
+            if not instruction.operands or instruction.operands[0].kind != "imm":
+                continue
+            target_address = unsigned32(instruction.operands[0].imm)
+            preceding = bisect_right(starts, target_address) - 1
+            if (preceding >= 0 and instructions[preceding].address < target_address
+                    < instructions[preceding].address + instructions[preceding].size):
+                raise ValueError("Reachable branch targets the middle of an instruction")
+        cursor = address
+        for instruction in instructions:
+            start = instruction.address
+            end = start + instruction.size
+            if end <= address:
+                continue
+            if start != cursor:
+                raise ValueError("Code fragment has an unreachable or split instruction")
+            cursor = end
+        if cursor != address + size:
+            raise ValueError("Code fragment has an unreachable or split instruction")
     relocations = []
     occupied = set()
     for at, index, kind in section["relocations"]:

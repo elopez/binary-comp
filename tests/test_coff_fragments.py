@@ -241,3 +241,99 @@ def test_direct_fragment_rejects_short_or_missing_reference_prefix(sample, bad_r
 
     with pytest.raises(ValueError, match="not completely file-backed"):
         compare_code_fragment(sample[0], sample[1], "sample", sample[2], ShortReader())
+
+
+def reachable_case(tmp_path, native, start, candidate, *, table=None):
+    coff = COFF.from_bytes(coff_bytes([{"data": candidate}], [
+        {"name": "reader", "section": 1, "type": 0x20},
+    ]))
+    image = reference(tmp_path, native, table)
+    return coff, fragment(TEXT_VA + start, 0, len(candidate)), {}, image
+
+
+def test_original_direct_jump_can_skip_undecodable_bytes(tmp_path):
+    # The entry jumps over an incomplete two-byte opcode to a clear window.
+    case = reachable_case(tmp_path, b"\xeb\x02\x0f\x3f\x90\xc3", 4, b"\x90\xc3")
+    assert compare(case)[0]
+
+
+def test_selected_fragment_cannot_cross_skipped_bytes(tmp_path):
+    case = reachable_case(tmp_path, b"\xeb\x02\x0f\x3f\x90\xc3", 2, b"\x90\x90\x90\xc3")
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(case)
+
+
+def test_unreachable_code_after_return_does_not_use_fallback(tmp_path):
+    case = reachable_case(tmp_path, b"\xc3\x0f\x90\xc3", 2, b"\x90\xc3")
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(case)
+
+
+def test_indirect_jump_table_is_not_assumed_for_fragment_reachability(tmp_path):
+    # The table points to the clear window, but only direct edges may prove it.
+    code = b"\xff\x24\x85" + struct.pack("<I", DATA_VA) + b"\x0f\x90\xc3"
+    case = reachable_case(tmp_path, code, 8, b"\x90\xc3", table=struct.pack("<I", TEXT_VA + 8))
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(case)
+
+
+def test_branch_into_middle_of_reachable_instruction_is_rejected(tmp_path):
+    # Fallthrough decodes the whole MOV, while the branch lands inside it.
+    case = reachable_case(tmp_path, b"\x75\x01\xb8\x90\xc3\x00\x00", 3, b"\x90\xc3\x00\x00")
+    with pytest.raises(ValueError, match="overlapping instruction"):
+        compare(case)
+
+
+def test_fragment_end_must_not_split_a_reachable_instruction(tmp_path):
+    code = b"\xeb\x01\x0f\xb8\x01\x02\x03\x04\xc3"
+    case = reachable_case(tmp_path, code, 3, b"\x90\x90\x90")
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(case)
+
+
+def test_branch_to_undecodable_middle_is_rejected(tmp_path):
+    code = bytes.fromhex("74 07 eb 03 0f 04 ff b8 90 0f 04 00 c3")
+    case = reachable_case(tmp_path, code, 7, code[7:])
+    with pytest.raises(ValueError, match="middle of an instruction"):
+        compare(case)
+
+
+@pytest.mark.parametrize("transfer", [b"\xcf", b"\xcd\x80", b"\x0f\x35", b"\xea" + bytes(6),
+                                      b"\x0f\xff", b"\x0f\xb9\xc0", b"\xf3\xc3", b"\xf2\xc3"])
+def test_unknown_or_terminal_transfers_do_not_prove_fallthrough(tmp_path, transfer):
+    prefix = b"\xeb\x02\x0f\x3f" + transfer
+    case = reachable_case(tmp_path, prefix + b"\x90\xc3", len(prefix), b"\x90\xc3")
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(case)
+
+
+def test_direct_conditional_branch_reaches_clear_fragment(tmp_path):
+    code = b"\x74\x02\x0f\x3f\x90\xc3"
+    assert compare(reachable_case(tmp_path, code, 4, b"\x90\xc3"))[0]
+
+
+def test_actual_coff_prefix_still_requires_linear_boundaries(tmp_path):
+    candidate = b"\xeb\x02\x0f\x3f\x90\xc3"
+    coff = COFF.from_bytes(coff_bytes([{"data": candidate}], [
+        {"name": "reader", "section": 1, "type": 0x20},
+    ]))
+    entry = fragment(TEXT_VA, 4, 2)
+    with pytest.raises(ValueError, match="boundary splits"):
+        compare_code_fragment(coff, entry, "sample", {}, reference(tmp_path, b"\x90\xc3"))
+
+
+@pytest.mark.parametrize("prefix", [b"", b"\xf2"])
+def test_call_target_inside_instruction_does_not_grant_a_boundary(tmp_path, prefix):
+    # Calls are not followed, but a direct target cannot split decoded code.
+    code = prefix + bytes.fromhex("e8 07 00 00 00 eb 03 0f 04 ff b8 90 0f 04 00 c3")
+    start = len(prefix) + 10
+    case = reachable_case(tmp_path, code, start, code[start:])
+    with pytest.raises(ValueError, match="middle of an instruction"):
+        compare(case)
+
+
+def test_prefixed_direct_jump_target_inside_instruction_is_rejected(tmp_path):
+    code = bytes.fromhex("eb 03 0f 04 ff b8 90 90 90 90 f2 eb f9")
+    case = reachable_case(tmp_path, code, 5, code[5:])
+    with pytest.raises(ValueError, match="middle of an instruction"):
+        compare(case)

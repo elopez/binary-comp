@@ -277,3 +277,11 @@ def test_reachable_disassembly_follows_shifted_base_jump_table(tmp_path):
 
     assert addresses.isdisjoint(range(table, case_zero))
     assert {case_zero, case_zero + 1, case_one, case_one + 1, default, default + 2} <= addresses
+
+    direct_only = disassemble_reachable_x86(
+        PEImage(str(exe)), TEXT_VA, [TEXT_VA, TEXT_VA + 0x40], max_bytes=0x40,
+        padding_mnemonics=frozenset({"nop", "int3"}), expand_indirect_jump_tables=False,
+    )
+    direct_addresses = {instr.address for instr in direct_only}
+    assert direct_addresses.isdisjoint({case_zero, case_one})
+    assert default in direct_addresses

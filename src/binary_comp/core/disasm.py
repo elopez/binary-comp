@@ -9,11 +9,13 @@ from typing import Iterable
 from .pe import PEImage
 
 try:
-    from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+    from capstone import (Cs, CS_ARCH_X86, CS_MODE_32, CS_GRP_INT, CS_GRP_IRET,
+                          CS_GRP_JUMP, CS_GRP_PRIVILEGE, CS_GRP_RET)
     from capstone.x86_const import X86_OP_IMM, X86_OP_MEM, X86_OP_REG
 except ImportError:  # pragma: no cover - exercised by users without optional extra
     Cs = None
     CS_ARCH_X86 = CS_MODE_32 = X86_OP_IMM = X86_OP_MEM = X86_OP_REG = None
+    CS_GRP_INT = CS_GRP_IRET = CS_GRP_JUMP = CS_GRP_PRIVILEGE = CS_GRP_RET = None
 
 
 @dataclass(frozen=True)
@@ -341,13 +343,16 @@ def disassemble_reachable_x86(
     starts: Iterable[int],
     max_bytes: int,
     padding_mnemonics: frozenset[str],
+    *,
+    expand_indirect_jump_tables: bool = True,
 ) -> list[Instruction]:
     """Decode only instructions reachable from a 32-bit x86 entry point.
 
     This is useful for call auditing when a linear sweep would decode switch
     tables, EH metadata, or alignment bytes after an early return as code.  A
     direct in-range branch is followed, and indexed indirect jumps enqueue the
-    in-range targets stored in their jump table.
+    in-range targets stored in their jump table by default. Disabling indirect
+    jump-table expansion also stops at unsupported or privileged transfers.
     """
     require_capstone()
     section_end = image.section_end_for_va(start)
@@ -434,12 +439,19 @@ def disassemble_reachable_x86(
             elif operands and operands[0].kind == "reg":
                 scaled_by_four.discard(operands[0].reg.lower())
 
+            if not expand_indirect_jump_tables and (
+                    mnemonic in {"ud0", "ud1"} or insn.group(CS_GRP_RET)
+                    or insn.group(CS_GRP_INT) or insn.group(CS_GRP_IRET)
+                    or insn.group(CS_GRP_PRIVILEGE)
+                    or (insn.group(CS_GRP_JUMP) and not (
+                        mnemonic.startswith("j") or mnemonic in {"loop", "loope", "loopne"}))):
+                break
             if mnemonic in {"ret", "retf", "iret", "int3", "hlt", "ud2"}:
                 break
             if mnemonic == "jmp":
                 if operands and operands[0].kind == "imm":
                     enqueue(unsigned32(operands[0].imm))
-                elif operands:
+                elif operands and expand_indirect_jump_tables:
                     enqueue_jump_table(operands[0], frozenset(scaled_by_four))
                 break
             if mnemonic.startswith("j") or mnemonic in {"loop", "loope", "loopne"}:
