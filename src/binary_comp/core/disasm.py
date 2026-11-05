@@ -345,6 +345,7 @@ def disassemble_reachable_x86(
     padding_mnemonics: frozenset[str],
     *,
     expand_indirect_jump_tables: bool = True,
+    entries: Iterable[int] = (),
 ) -> list[Instruction]:
     """Decode only instructions reachable from a 32-bit x86 entry point.
 
@@ -353,6 +354,7 @@ def disassemble_reachable_x86(
     direct in-range branch is followed, and indexed indirect jumps enqueue the
     in-range targets stored in their jump table by default. Disabling indirect
     jump-table expansion also stops at unsupported or privileged transfers.
+    Explicit ``entries`` add independently verified in-range roots.
     """
     require_capstone()
     section_end = image.section_end_for_va(start)
@@ -369,6 +371,10 @@ def disassemble_reachable_x86(
     md.detail = True
     pending = [start]
     decoded: dict[int, Instruction] = {}
+    # Additional verified entry points, such as native switch table targets.
+    for entry in entries:
+        if start <= entry < end and entry not in pending:
+            pending.append(entry)
 
     def enqueue(address: int) -> None:
         if start <= address < end and address not in decoded and address not in pending:

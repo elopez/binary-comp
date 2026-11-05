@@ -337,3 +337,50 @@ def test_prefixed_direct_jump_target_inside_instruction_is_rejected(tmp_path):
     case = reachable_case(tmp_path, code, 5, code[5:])
     with pytest.raises(ValueError, match="middle of an instruction"):
         compare(case)
+
+
+def table_case(tmp_path, *, native_entry=11, count=2, table_value=16, declare=True):
+    """An indexed switch whose second case follows bytes only the table skips."""
+    actual = bytearray(b"\xff\x24\x85" + bytes(4) + b"\x90\xc3" + b"\x90\x90" + b"\x90\xc3"
+                       + b"\x90\x90\x90" + bytes(8))
+    coff = COFF.from_bytes(coff_bytes([{"data": bytes(actual), "relocations": [
+        (3, 1, 6), (16, 2, 6), (20, 3, 6)]}], [
+        {"name": "reader", "section": 1, "type": 0x20},
+        {"name": "$Ltable", "section": 1, "storage": 6, "value": table_value},
+        {"name": "$Lfirst", "section": 1, "storage": 6, "value": 7},
+        {"name": "$Lsecond", "section": 1, "storage": 6, "value": 11},
+    ]))
+    native = (b"\xff\x24\x85" + struct.pack("<I", TEXT_VA + 16) + b"\x90\xc3" + b"\x0f\x3f"
+              + b"\x90\xc3" + b"\x90\x90\x90"
+              + struct.pack("<II", TEXT_VA + 7, TEXT_VA + native_entry))
+    entry = fragment(TEXT_VA + 11, 11, 2)
+    if declare:
+        entry["sample"]["jump_tables"] = [{"symbol": "$Ltable", "count": count}]
+    return coff, entry, {}, reference(tmp_path, native)
+
+
+def test_declared_native_jump_table_reaches_clear_case(tmp_path):
+    assert compare(table_case(tmp_path))[0]
+
+
+def test_undeclared_jump_table_still_does_not_prove_reachability(tmp_path):
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(table_case(tmp_path, declare=False))
+
+
+def test_declared_jump_table_must_equal_native_entries(tmp_path):
+    with pytest.raises(ValueError, match="jump table differs"):
+        compare(table_case(tmp_path, native_entry=9))
+
+
+@pytest.mark.parametrize("change", [{"count": 3}, {"table_value": 15}])
+def test_declared_jump_table_must_be_complete_inline_label_entries(tmp_path, change):
+    with pytest.raises(ValueError, match="jump table"):
+        compare(table_case(tmp_path, **change))
+
+
+def test_jump_table_declaration_requires_exact_record(tmp_path):
+    case = table_case(tmp_path)
+    case[1]["sample"]["jump_tables"] = [{"symbol": "$Ltable", "count": 2, "extra": 1}]
+    with pytest.raises(ValueError, match="Invalid code fragment jump table"):
+        compare(case)

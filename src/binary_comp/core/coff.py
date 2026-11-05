@@ -1287,12 +1287,14 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
     owner, start, end = coff.function_owner(section)
     if offset + size > len(section["data"]):
         raise ValueError("Code fragment outside native function window")
+    jump_tables = _fragment_jump_tables(coff, symbol, section, start, end, target)
     for native_symbol in coff.symbols.values():
         if (native_symbol["section"] == symbol["section"]
                 and native_symbol["storage"] in (2, 3)
                 and native_symbol["type"] == 0
                 and start <= native_symbol["value"] < end
-                and not _is_section_definition(coff, native_symbol, owner)):
+                and not _is_section_definition(coff, native_symbol, owner)
+                and not any(native_symbol is table["symbol"] for table in jump_tables)):
             raise ValueError("Code fragment function contains native data")
     # A partial claim cannot own an inline table, vector, or other data. Refuse
     # configured data in this native function even if outside the chosen slice.
@@ -1311,6 +1313,12 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
     if existing is not None and _binding_address(existing["va"], fragment["symbol"]) != owner_address:
         raise ValueError("Code fragment owner binding differs from declared owner_va")
     bindings = {**bindings, fragment["symbol"]: {**(existing or {}), "va": target["owner_va"]}}
+    for table in jump_tables:
+        name = table["symbol"]["name"]
+        table_address = hex(owner_address + table["symbol"]["value"])
+        if name in bindings and _binding_address(bindings[name]["va"], name) != int(table_address, 16):
+            raise ValueError(f"Code fragment jump table binding differs from its owner offset: {name}")
+        bindings[name] = {"va": table_address}
     _validate_function_alias_bindings(coff, section, owner_address, bindings)
     _layout_code_window(coff, bindings, reference, address, size, common_definitions)
     for _, data_section, data_address, data_size in executable_data_definitions(
@@ -1323,6 +1331,7 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
             region_start = _binding_address(target_region["va"], region["symbol"])
             if address < region_start + target_region["size"] and region_start < address + size:
                 raise ValueError("Code fragment overlaps complete code region")
+    table_entries = _check_fragment_jump_tables(jump_tables, section, owner_address, reference)
     original_section = reference.section_for_va(owner_address)
     if (original_section is None or not original_section.flags & EXECUTABLE_FLAG
             or address + size > original_section.start + original_section.rawsize):
@@ -1358,7 +1367,7 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
 
         instructions = disassemble_reachable_x86(
             PrefixImage(), owner_address, (), len(original_prefix), frozenset(),
-            expand_indirect_jump_tables=False)
+            expand_indirect_jump_tables=False, entries=table_entries)
         starts = [instruction.address for instruction in instructions]
         for left, right in zip(instructions, instructions[1:]):
             if left.address + left.size > right.address:
@@ -1400,6 +1409,72 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
                                   common_definitions=common_definitions, code_regions=code_regions)
     original = original_prefix[-size:]
     return compare_binary(original, rebuilt).exact, rebuilt, original, count, raw
+
+
+def _fragment_jump_tables(coff, symbol, section, start, end, target):
+    """Resolve explicitly declared inline switch tables of a fragment owner.
+
+    A table is a static untyped label in the owner's own section whose every
+    four-byte entry carries one DIR32 relocation to a label in that section.
+    """
+    declared = target.get("jump_tables", [])
+    if not isinstance(declared, list):
+        raise ValueError("Invalid code fragment jump_tables")
+    tables, seen = [], set()
+    for item in declared:
+        if (not isinstance(item, Mapping) or set(item) != {"symbol", "count"}
+                or not isinstance(item["symbol"], str) or type(item["count"]) is not int
+                or item["count"] <= 0 or item["symbol"] in seen):
+            raise ValueError("Invalid code fragment jump table")
+        seen.add(item["symbol"])
+        matches = [s for s in coff.symbols.values()
+                   if s["name"] == item["symbol"] and s["section"] == symbol["section"]
+                   and s["storage"] in (3, 6) and s["type"] == 0 and s["aux_count"] == 0]
+        if len(matches) != 1:
+            raise ValueError(f"Code fragment jump table is not one inline label: {item['symbol']}")
+        table = matches[0]
+        first, last = table["value"], table["value"] + 4 * item["count"]
+        if first % 4 or not start <= first < last <= end or last > len(section["data"]):
+            raise ValueError(f"Code fragment jump table outside its owner: {item['symbol']}")
+        relocations = []
+        for at, index, kind in section["relocations"]:
+            if at + 4 > first and at < last:
+                if (at - first) % 4 or kind != 0x6:
+                    raise ValueError(f"Malformed code fragment jump table: {item['symbol']}")
+                label = coff.resolve_symbol(index)
+                if label["section"] != symbol["section"] or not start <= label["value"] < first:
+                    raise ValueError(f"Jump table entry leaves its owner code: {item['symbol']}")
+                relocations.append((at - first, label["value"]))
+        if sorted(at for at, _ in relocations) != list(range(0, last - first, 4)):
+            raise ValueError(f"Jump table entries need one fixup each: {item['symbol']}")
+        tables.append({"symbol": table, "count": item["count"], "targets": relocations})
+    return tables
+
+
+def _check_fragment_jump_tables(tables, section, owner_address, reference):
+    """Compare each declared table with native bytes; return its native entries.
+
+    Table and case labels live in the owner's own section, so their addresses
+    follow from the declared owner origin and their object offsets alone.
+    """
+    entries = []
+    for table in tables:
+        name = table["symbol"]["name"]
+        first = table["symbol"]["value"]
+        address = owner_address + first
+        size = 4 * table["count"]
+        original = reference.read(address, size)
+        if not isinstance(original, bytes) or len(original) != size:
+            raise ValueError(f"Code fragment jump table is not file-backed: {name}")
+        rebuilt = bytearray(section["data"][first:first + size])
+        for at, label_value in table["targets"]:
+            value = owner_address + label_value + u32(rebuilt, at)
+            struct.pack_into("<I", rebuilt, at, value & 0xFFFFFFFF)
+        if bytes(rebuilt) != original:
+            raise ValueError(f"Code fragment jump table differs from native: {name}")
+        entries.extend(struct.unpack_from("<I", original, at)[0] for at in range(0, size, 4))
+    return tuple(entries)
+
 
 def inline_vector_records(region):
     """Validate region-only native vector declarations, never arbitrary ranges."""
