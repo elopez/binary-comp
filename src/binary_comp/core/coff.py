@@ -1332,6 +1332,7 @@ def compare_code_fragment(coff, fragment, version, bindings, reference, *,
             if address < region_start + target_region["size"] and region_start < address + size:
                 raise ValueError("Code fragment overlaps complete code region")
     table_entries = _check_fragment_jump_tables(jump_tables, section, owner_address, reference)
+    table_entries += _fragment_entries(target, section, offset, size, address)
     original_section = reference.section_for_va(owner_address)
     if (original_section is None or not original_section.flags & EXECUTABLE_FLAG
             or address + size > original_section.start + original_section.rawsize):
@@ -1449,6 +1450,51 @@ def _fragment_jump_tables(coff, symbol, section, start, end, target):
             raise ValueError(f"Jump table entries need one fixup each: {item['symbol']}")
         tables.append({"symbol": table, "count": item["count"], "targets": relocations})
     return tables
+
+
+def _fragment_entries(target, section, offset, size, address):
+    """Resolve declared entry points of a fragment reached from outside it.
+
+    Code inside a window can be entered only from bytes the claim excludes, so
+    a walk from the owner origin never reaches it. Each declared entry must lie
+    inside the window and be the target of a direct, unrelocated jump in the
+    compiled object that starts outside the window. Entries only seed the
+    original boundary walk; every byte is still compared.
+    """
+    import re
+    from binary_comp.core.disasm import disassemble_raw
+
+    declared = target.get("entries", [])
+    if not isinstance(declared, list):
+        raise ValueError("Invalid code fragment entries")
+    entries = []
+    for item in declared:
+        if (not isinstance(item, str) or not re.fullmatch(r"0x[0-9a-fA-F]+", item)
+                or int(item, 16) in entries):
+            raise ValueError("Invalid code fragment entry")
+        entry = int(item, 16)
+        if not address <= entry < address + size:
+            raise ValueError(f"Code fragment entry outside its window: {item}")
+        entries.append(entry)
+    if not entries:
+        return ()
+    relocated = set()
+    for at, _, _ in section["relocations"]:
+        relocated.update(range(at, at + 4))
+    targets = set()
+    for instruction in disassemble_raw(section["data"][:offset + size], 0, bits=32):
+        start, end = instruction.address, instruction.address + instruction.size
+        if (offset <= start < offset + size or not instruction.mnemonic.startswith("j")
+                or relocated.intersection(range(start, end))):
+            continue
+        # Capstone prints direct targets as hexadecimal, or decimal below ten.
+        if re.fullmatch(r"0x[0-9a-f]+|[0-9]", instruction.op_str):
+            targets.add(int(instruction.op_str, 0))
+    for entry in entries:
+        if offset + entry - address not in targets:
+            raise ValueError("Code fragment entry is not a direct jump target from "
+                             f"outside its window: {hex(entry)}")
+    return tuple(entries)
 
 
 def _check_fragment_jump_tables(tables, section, owner_address, reference):

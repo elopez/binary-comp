@@ -384,3 +384,61 @@ def test_jump_table_declaration_requires_exact_record(tmp_path):
     case[1]["sample"]["jump_tables"] = [{"symbol": "$Ltable", "count": 2, "extra": 1}]
     with pytest.raises(ValueError, match="Invalid code fragment jump table"):
         compare(case)
+
+
+def entry_case(tmp_path, *, candidate=b"\xc3\xeb\x02\x90\x90\x90\xc3", entries=("0x5",),
+               relocations=()):
+    """A clear tail entered only by a jump from bytes the window excludes."""
+    coff = COFF.from_bytes(coff_bytes([{"data": candidate, "relocations": list(relocations)}], [
+        {"name": "reader", "section": 1, "type": 0x20}, {"name": "outside"},
+    ]))
+    entry = fragment(TEXT_VA + 5, 5, 2)
+    if entries is not None:
+        entry["sample"]["entries"] = [hex(TEXT_VA + int(item, 16)) if item.startswith("0x")
+                                      else item for item in entries]
+    native = b"\xc3\x0f\x3f\x90\x90\x90\xc3"
+    return coff, entry, {"outside": {"va": hex(DATA_VA)}}, reference(tmp_path, native)
+
+
+def test_declared_entry_reaches_tail_entered_from_excluded_bytes(tmp_path):
+    assert compare(entry_case(tmp_path))[0]
+
+
+def test_tail_without_declared_entry_stays_unreachable(tmp_path):
+    with pytest.raises(ValueError, match="unreachable or split"):
+        compare(entry_case(tmp_path, entries=None))
+
+
+def test_entry_must_be_object_jump_target_from_outside_window(tmp_path):
+    # The object falls into the tail instead of jumping to it.
+    with pytest.raises(ValueError, match="not a direct jump target"):
+        compare(entry_case(tmp_path, candidate=b"\xc3\x90\x90\x90\x90\x90\xc3"))
+    # A jump inside the window does not prove an outside entry.
+    case = entry_case(tmp_path, candidate=b"\xc3\x90\x90\x90\x90\xeb\xfe", entries=("0x5",))
+    with pytest.raises(ValueError, match="not a direct jump target"):
+        compare(case)
+
+
+def test_relocated_jump_does_not_prove_an_entry(tmp_path):
+    candidate = b"\xe9\x00\x00\x00\x00\x90\xc3"
+    case = entry_case(tmp_path, candidate=candidate, relocations=[(1, 1, 0x14)])
+    with pytest.raises(ValueError, match="not a direct jump target"):
+        compare(case)
+
+
+@pytest.mark.parametrize("entries,message", [
+    (("0x4",), "outside its window"),
+    (("0x7",), "outside its window"),
+    (("0x5", "0x5"), "Invalid code fragment entry"),
+    (("5",), "Invalid code fragment entry"),
+])
+def test_entry_declarations_are_exact(tmp_path, entries, message):
+    with pytest.raises(ValueError, match=message):
+        compare(entry_case(tmp_path, entries=entries))
+
+
+def test_entries_must_be_a_list(tmp_path):
+    case = entry_case(tmp_path)
+    case[1]["sample"]["entries"] = hex(TEXT_VA + 5)
+    with pytest.raises(ValueError, match="Invalid code fragment entries"):
+        compare(case)

@@ -567,7 +567,12 @@ its owner's inline switch tables as `"jump_tables": [{"symbol": "$L12",
 "count": 11}]`. Each must be one untyped label in the owner section whose every
 entry has exactly one DIR32 fixup to a label in the owner's code. Its address
 follows from the owner origin; after fixups it must equal the native table, and
-only then do the native entries seed the bounded walk. Capstone is required. Only
+only then do the native entries seed the bounded walk. Code that is entered only
+from bytes outside every claimed window, such as a tail reached from an excluded
+region, may be declared as `"entries": ["0x401005"]`. Each entry must lie inside
+the window and be the target of a direct, unrelocated jump in the compiled
+object that starts outside the window; it then seeds the bounded walk as well.
+Entries never exempt bytes from comparison. Capstone is required. Only
 relocations wholly inside the fixed
 window are applied with the ordinary strict binding and data checks; all bytes
 participate in raw and relocation-corrected comparisons. Windows may not overlap
